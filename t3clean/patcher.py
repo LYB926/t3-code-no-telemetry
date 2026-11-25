@@ -1,7 +1,8 @@
-"""Deterministic, idempotent de-telemetry source patcher for T3 Code.
+"""Deterministic, idempotent de-telemetry & build-safety source patcher for T3 Code.
 
-Applies 6 targeted de-telemetry rules across upstream v0.1.11, v0.1.12, and main
-while keeping model manifest and usage pricing services intact (rules 7 & 8).
+Applies 6 targeted de-telemetry rules plus 1 Tailwind CSS v4 source-scan guard
+across upstream v0.1.11, v0.1.12, and main while keeping model manifest and
+usage pricing services intact (rules 7 & 8).
 """
 
 from dataclasses import dataclass
@@ -525,12 +526,56 @@ def _ts_replace_function_body(
     return source[:body_open_idx] + formatted_body + source[body_close_idx + 1 :]
 
 
+CSS_PATCH_MARKER = "/* @t3-no-telemetry-patched */"
+
+_TAILWIND_IMPORT_RE = re.compile(
+    r'^([ \t]*@import\s+["\']tailwindcss["\'][^;\n]*;[ \t]*)$',
+    re.MULTILINE,
+)
+_TAILWIND_EXCLUDE_NODE_MODULES_RE = re.compile(
+    r'@source\s+not\s+["\']\.\./node_modules["\']\s*;'
+)
+
+
 def _patch_is_already_patched(content: str) -> bool:
-    return any(line.strip() == PATCH_MARKER for line in content.splitlines())
+    return any(
+        line.strip() in (PATCH_MARKER, CSS_PATCH_MARKER)
+        for line in content.splitlines()
+    )
 
 
 def _patch_prepend_marker(content: str) -> str:
     return f"{PATCH_MARKER}\n{content}"
+
+
+def _patch_web_tailwind_source_ignore(original: str) -> tuple[str, str]:
+    """Build-safety rule: Exclude ../node_modules from Tailwind CSS v4 scanning.
+
+    When building from a source tarball (no .git directory) extracted inside an
+    enclosing Git repo whose .gitignore ignores the build directory (such as
+    packaging/arch/src/), @tailwindcss/oxide sees that its scan root is ignored
+    and disables all .gitignore filtering — scanning all of apps/web/node_modules
+    (~3.9 GB via pnpm symlinks) and triggering 20+ GiB OOM crashes.
+    """
+    match = _TAILWIND_IMPORT_RE.search(original)
+    if match is None:
+        raise PatchAnchorNotFoundError(
+            '[tailwind-source-ignore] apps/web/src/index.css: '
+            'missing anchor @import "tailwindcss";'
+        )
+    if _TAILWIND_EXCLUDE_NODE_MODULES_RE.search(original):
+        return (
+            f"{CSS_PATCH_MARKER}\n{original}",
+            "marked existing Tailwind ../node_modules exclusion",
+        )
+
+    import_line = match.group(1)
+    replacement = f'{import_line}\n@source not "../node_modules";'
+    updated = original[: match.start()] + replacement + original[match.end() :]
+    return (
+        f"{CSS_PATCH_MARKER}\n{updated}",
+        'excluded ../node_modules from Tailwind v4 scanning (@source not "../node_modules")',
+    )
 
 
 def _patch_analytics_service(original: str) -> tuple[str, str]:
@@ -1001,6 +1046,11 @@ def patch_source_tree(
             "relay-tracing",
             "packages/shared/src/relayTracing.ts",
             _patch_relay_tracing,
+        ),
+        (
+            "tailwind-source-ignore",
+            "apps/web/src/index.css",
+            _patch_web_tailwind_source_ignore,
         ),
     ]
 

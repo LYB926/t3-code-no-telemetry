@@ -30,6 +30,7 @@
 | 4 | `packages/shared/src/relayTracing.ts` | 全文件替换为 No-Op Stub：保留所有导出符号，`layer()` 恒返回 `Layer.succeed(RelayClientTracer, Option.none())`，彻底移除 `OtlpTracer` 与 `X-Axiom-Dataset`（Axiom/OTLP 链路追踪）。 |
 | 5 | `apps/desktop/src/updates/DesktopUpdatePolicy.ts` | 将 `unmanagedUpdatePolicy` 锁定为 `{ mode: "off", feedUrl: undefined, allowNightly: false, message: null }`，彻底禁用桌面端自动更新（可通过 `--keep-updater` 保留）。 |
 | 6 | `apps/web/src/cloud/publicConfig.ts`<br>`apps/server/src/cloud/publicConfig.ts` | 强锁 `hasCloudPublicConfig` 为 `false`，`resolveRelayTracingConfig` / `resolveRelayClientTracingConfig` 恒返回 `null`，彻底切断 Clerk / T3 Connect 云端遥测与登录钩子（可通过 `--keep-cloud` 保留）。 |
+| 构建防护 | `apps/web/src/index.css` | 在 `@import "tailwindcss";` 后注入 `@source not "../node_modules";`：防止从源码压缩包（无 `.git`）在外层仓库的被 `.gitignore` 忽略目录（如 `packaging/arch/src/`）构建时，Tailwind CSS v4（`@tailwindcss/oxide`）停用 `.gitignore` 过滤并扫描整个 `node_modules` 引发 20+ GiB OOM。 |
 
 此外，构建阶段（`t3clean/builder.py`）会自动清理 `.env` / `.env.local` 并剥离环境变量中的 Clerk / Relay / OTLP / 更新仓库 / 签名凭据，同时注入 `T3CODE_TELEMETRY_ENABLED=false`、`DO_NOT_TRACK=1`、`T3CODE_TELEMETRY_CHANNEL=dev`、`T3CODE_WEB_SOURCEMAP=false`。
 

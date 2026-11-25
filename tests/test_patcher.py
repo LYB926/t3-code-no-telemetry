@@ -6,6 +6,7 @@ import unittest
 
 from t3clean import DEFAULT_NODE_VERSION, DEFAULT_REF, DEFAULT_REPO_URL, PATCH_MARKER
 from t3clean.patcher import (
+    CSS_PATCH_MARKER,
     FilePatchResult,
     PatchAnchorNotFoundError,
     PatchOptions,
@@ -369,6 +370,14 @@ const LITELLM_RATES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/mai
 export { LITELLM_RATES_URL };
 """
 
+SAMPLE_WEB_INDEX_CSS = """\
+/* Clerk injects its component styles into the clerk layer. */
+@layer theme, base, clerk, components, utilities;
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark, .dark *));
+"""
+
 
 def _write_mock_tree(root: Path, *, legacy_v0111: bool = False) -> None:
     files = {
@@ -381,6 +390,7 @@ def _write_mock_tree(root: Path, *, legacy_v0111: bool = False) -> None:
         "apps/web/src/connection/platform.ts": SAMPLE_PLATFORM_TS,
         "packages/client-runtime/src/authorization/remote.ts": SAMPLE_REMOTE_TS,
         "packages/shared/src/relayTracing.ts": SAMPLE_RELAY_TRACING_TS,
+        "apps/web/src/index.css": SAMPLE_WEB_INDEX_CSS,
         "apps/desktop/src/updates/DesktopUpdatePolicy.ts": SAMPLE_DESKTOP_UPDATE_POLICY_TS,
         "apps/web/src/cloud/publicConfig.ts": SAMPLE_WEB_PUBLIC_CONFIG_TS,
         "apps/server/src/cloud/publicConfig.ts": SAMPLE_SERVER_PUBLIC_CONFIG_TS,
@@ -478,7 +488,7 @@ class TestPatchSourceTree(unittest.TestCase):
             self.assertFalse(pre_report.ok)
 
             results = patch_source_tree(root)
-            self.assertEqual(len(results), 8)
+            self.assertEqual(len(results), 9)
             self.assertTrue(all(isinstance(r, FilePatchResult) for r in results))
             self.assertTrue(all(r.changed and not r.already_patched for r in results))
 
@@ -533,6 +543,13 @@ class TestPatchSourceTree(unittest.TestCase):
             self.assertIn("export function nonInterferingTracer", relay)
             self.assertIn("export function layer", relay)
 
+            # Tailwind v4 source scan guard (valid CSS comment marker, excludes ../node_modules)
+            web_css = (root / "apps/web/src/index.css").read_text(encoding="utf-8")
+            self.assertTrue(web_css.startswith(CSS_PATCH_MARKER))
+            self.assertNotIn(PATCH_MARKER, web_css)
+            self.assertIn('@import "tailwindcss";\n@source not "../node_modules";', web_css)
+            self.assertIn("@custom-variant dark", web_css)
+
             # Desktop update policy disabled
             updater = (root / "apps/desktop/src/updates/DesktopUpdatePolicy.ts").read_text(
                 encoding="utf-8"
@@ -575,7 +592,7 @@ class TestPatchSourceTree(unittest.TestCase):
 
             # Second patch run must be strictly idempotent.
             second_results = patch_source_tree(root)
-            self.assertEqual(len(second_results), 8)
+            self.assertEqual(len(second_results), 9)
             self.assertTrue(all((not r.changed) and r.already_patched for r in second_results))
 
     def test_patch_v0111_tree_preserves_legacy_exports(self) -> None:
@@ -584,7 +601,7 @@ class TestPatchSourceTree(unittest.TestCase):
             _write_mock_tree(root, legacy_v0111=True)
 
             results = patch_source_tree(root)
-            self.assertEqual(len(results), 8)
+            self.assertEqual(len(results), 9)
             self.assertTrue(all(r.changed for r in results))
 
             analytics = (root / "apps/server/src/telemetry/AnalyticsService.ts").read_text(
@@ -616,7 +633,7 @@ class TestPatchSourceTree(unittest.TestCase):
                 root,
                 PatchOptions(keep_updater=True, keep_cloud=True),
             )
-            self.assertEqual(len(results), 5)
+            self.assertEqual(len(results), 6)
             self.assertEqual(
                 (root / "apps/desktop/src/updates/DesktopUpdatePolicy.ts").read_text(encoding="utf-8"),
                 SAMPLE_DESKTOP_UPDATE_POLICY_TS,
@@ -636,7 +653,7 @@ class TestPatchSourceTree(unittest.TestCase):
             _write_mock_tree(root, legacy_v0111=False)
 
             results = patch_source_tree(root, PatchOptions(dry_run=True))
-            self.assertEqual(len(results), 8)
+            self.assertEqual(len(results), 9)
             self.assertTrue(all(r.changed and not r.already_patched for r in results))
             self.assertTrue(all(r.summary.startswith("dry-run:") for r in results))
             self.assertEqual(
@@ -665,6 +682,32 @@ class TestPatchSourceTree(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(PatchAnchorNotFoundError):
                 patch_source_tree(Path(tmp))
+
+    def test_tailwind_source_ignore_no_duplicate_and_missing_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_mock_tree(root, legacy_v0111=False)
+            css_path = root / "apps/web/src/index.css"
+            css_path.write_text(
+                '@import "tailwindcss";\n@source not "../node_modules";\n',
+                encoding="utf-8",
+            )
+            patch_source_tree(root)
+            css_text = css_path.read_text(encoding="utf-8")
+            self.assertEqual(css_text.count('@source not "../node_modules";'), 1)
+            self.assertTrue(css_text.startswith(CSS_PATCH_MARKER))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_mock_tree(root, legacy_v0111=False)
+            (root / "apps/web/src/index.css").write_text("body { color: red; }\n", encoding="utf-8")
+            with self.assertRaises(PatchAnchorNotFoundError):
+                patch_source_tree(root)
+            # Atomic staging: AnalyticsService.ts stays untouched when CSS anchor fails.
+            self.assertEqual(
+                (root / "apps/server/src/telemetry/AnalyticsService.ts").read_text(encoding="utf-8"),
+                SAMPLE_ANALYTICS_V0112,
+            )
 
 
 if __name__ == "__main__":

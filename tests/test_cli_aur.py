@@ -136,6 +136,10 @@ def _write_mock_upstream_tree(root: Path) -> None:
             '  return OtlpTracer.layer({ url: config.tracesUrl, headers: { "X-Axiom-Dataset": config.tracesDataset } });\n'
             '}\n'
         ),
+        "apps/web/src/index.css": (
+            '@layer theme, base, clerk, components, utilities;\n'
+            '@import "tailwindcss";\n'
+        ),
         "apps/desktop/src/updates/DesktopUpdatePolicy.ts": (
             'export interface UpdatePolicy {\n'
             '  readonly mode: string;\n'

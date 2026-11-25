@@ -1,0 +1,18 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local build & export outputs
+.t3clean-work/
+dist-t3clean/
+dist-aur/
+
+# Arch / makepkg working artifacts
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.*
+packaging/arch/t3code/
+packaging/arch/out/
+packaging/arch/out-deb/

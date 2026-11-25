@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=T3 Code (No Telemetry)
+GenericName=Coding Agent IDE
+Comment=Minimal desktop GUI for coding agents (de-telemetrized source build)
+Exec=t3-code-no-telemetry %U
+Terminal=false
+Type=Application
+Icon=t3-code-no-telemetry
+StartupWMClass=com.t3tools.T3Code
+StartupNotify=true
+Categories=Development;IDE;
+MimeType=x-scheme-handler/t3code;

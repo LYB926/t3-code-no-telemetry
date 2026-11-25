@@ -1,0 +1,304 @@
+# Maintainer: Zhang Ke
+# Thin Arch / CachyOS PKGBUILD wrapper invoking ../../t3clean.py.
+# For standalone AUR uploads (flat directory with zero ../../ paths), run:
+#   python3 t3clean.py export-aur --out <dir>
+
+pkgname=t3-code-no-telemetry
+pkgver=0.1.12
+pkgrel=1
+pkgdesc='T3 Code desktop application built from source with telemetry, device tracking, and cloud auth stripped'
+arch=('x86_64' 'aarch64')
+url='https://github.com/pingdotgg/t3code'
+license=('MIT')
+options=('!strip' '!debug')
+
+# Pinned stable upstream ref by default; override with e.g. T3CODE_REF=main
+_upstream_ref="${T3CODE_REF:-v0.1.12}"
+
+# Optional build switches (all disabled by default)
+_build_deb="${T3CLEAN_BUILD_DEB:-0}"
+_use_system_electron="${T3CLEAN_USE_SYSTEM_ELECTRON:-0}"
+_system_electron_bin="${T3CLEAN_SYSTEM_ELECTRON_BIN:-electron}"
+_keep_updater="${T3CLEAN_KEEP_UPDATER:-0}"
+_keep_cloud="${T3CLEAN_KEEP_CLOUD:-0}"
+_strict_offline="${T3CLEAN_STRICT_OFFLINE:-0}"
+
+# Coexists cleanly with t3code-bin (no conflicts/provides overlap).
+# Shares user state (~/.t3/userdata/ and ~/.config/t3code-v2/) while using
+# independent /usr/lib/t3-code-no-telemetry and /usr/bin/t3-code-no-telemetry.
+depends=(
+  'alsa-lib'
+  'at-spi2-core'
+  'cairo'
+  'dbus'
+  'expat'
+  'gdk-pixbuf2'
+  'glib2'
+  'gtk3'
+  'hicolor-icon-theme'
+  'libcups'
+  'libdbusmenu-glib'
+  'libdrm'
+  'libsecret'
+  'libx11'
+  'libxcb'
+  'libxcomposite'
+  'libxdamage'
+  'libxext'
+  'libxfixes'
+  'libxkbcommon'
+  'libxrandr'
+  'libxss'
+  'libxtst'
+  'mesa'
+  'nspr'
+  'nss'
+  'pango'
+  'systemd-libs'
+  'xdg-utils'
+)
+if [[ "${_use_system_electron}" == "1" ]]; then
+  depends+=("${_system_electron_bin}")
+fi
+
+makedepends=(
+  'git'
+  'python'
+  'nodejs>=26.12.1'
+  'npm'
+  'gcc'
+  'make'
+  'rust'
+  'pkgconf'
+  'imagemagick'
+  'vite-plus>=1.4.0'
+)
+
+optdepends=(
+  'openai-codex: use the system-installed Codex CLI'
+)
+
+if [[ "${_upstream_ref}" =~ ^v[0-9] ]]; then
+  _git_fragment="#tag=${_upstream_ref}"
+elif [[ "${_upstream_ref}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+  _git_fragment="#commit=${_upstream_ref}"
+else
+  _git_fragment="#branch=${_upstream_ref}"
+fi
+
+source=(
+  "t3code::git+https://github.com/pingdotgg/t3code.git${_git_fragment}"
+  "t3-code-no-telemetry.sh"
+  "t3-code-no-telemetry.desktop"
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+_t3clean_repo_root() {
+  if [[ -n "${T3CLEAN_REPO_ROOT:-}" ]]; then
+    printf '%s' "${T3CLEAN_REPO_ROOT}"
+  else
+    cd "${startdir}/../.." && pwd
+  fi
+}
+
+_t3clean_arch() {
+  case "${CARCH}" in
+    x86_64)  printf 'x64' ;;
+    aarch64) printf 'arm64' ;;
+    *)       printf 'x64' ;;
+  esac
+}
+
+_t3clean_semver() {
+  if [[ "${pkgver}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.(.+)$ ]]; then
+    printf '%s-%s+notelemetry' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s+notelemetry' "${pkgver}"
+  fi
+}
+
+# AUR-compliant caching: defaults to $srcdir/.cache (clean-chroot safe).
+# Set T3CLEAN_CACHE_DIR (e.g. ~/.cache/t3-code-no-telemetry) to persist
+# ELECTRON_CACHE, ELECTRON_BUILDER_CACHE, CARGO_HOME, PNPM_HOME, npm_config_store_dir
+# across rebuilds.
+_t3clean_cache_dir() {
+  if [[ -n "${T3CLEAN_CACHE_DIR:-}" ]]; then
+    printf '%s' "${T3CLEAN_CACHE_DIR}"
+  else
+    printf '%s' "${srcdir}/.cache"
+  fi
+}
+
+pkgver() {
+  cd "${srcdir}/t3code"
+  local desc rest count hash tag
+
+  desc=$(git describe --long --tags --abbrev=7 --match='v[0-9]*' --exclude='*nightly*' --exclude='*preview*' 2>/dev/null) || {
+    printf '0.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+    return
+  }
+
+  hash=${desc##*-g}
+  rest=${desc%-g*}
+  count=${rest##*-}
+  tag=${rest%-${count}}
+  tag=${tag%-}
+  tag=${tag#v}
+  tag=${tag//-/.}
+
+  if [[ "${count}" == "0" ]]; then
+    printf '%s' "${tag}"
+  else
+    printf '%s.r%s.g%s' "${tag}" "${count}" "${hash}"
+  fi
+}
+
+prepare() {
+  local _repo_root
+  _repo_root="$(_t3clean_repo_root)"
+  local _patch_args=(--source "${srcdir}/t3code")
+  if [[ "${_keep_updater}" == "1" ]]; then
+    _patch_args+=(--keep-updater)
+  fi
+  if [[ "${_keep_cloud}" == "1" ]]; then
+    _patch_args+=(--keep-cloud)
+  fi
+  python3 "${_repo_root}/t3clean.py" patch "${_patch_args[@]}"
+}
+
+build() {
+  local _repo_root _arch _build_ver _cache_dir
+  _repo_root="$(_t3clean_repo_root)"
+  _arch="$(_t3clean_arch)"
+  _build_ver="$(_t3clean_semver)"
+  _cache_dir="$(_t3clean_cache_dir)"
+
+  mkdir -p "${_cache_dir}/electron" "${_cache_dir}/electron-builder" "${_cache_dir}/cargo" "${_cache_dir}/pnpm" "${_cache_dir}/pnpm-store"
+  export ELECTRON_CACHE="${_cache_dir}/electron"
+  export ELECTRON_BUILDER_CACHE="${_cache_dir}/electron-builder"
+  export CARGO_HOME="${_cache_dir}/cargo"
+  export PNPM_HOME="${_cache_dir}/pnpm"
+  export npm_config_store_dir="${_cache_dir}/pnpm-store"
+
+  local _build_args=(
+    --source "${srcdir}/t3code"
+    --skip-fetch
+    --skip-patch
+    --skip-verify
+    --target desktop-dir
+    --arch "${_arch}"
+    --version "${_build_ver}"
+    --output-dir "${srcdir}/out"
+    --cache-dir "${_cache_dir}"
+  )
+  if [[ "${_use_system_electron}" == "1" ]]; then
+    _build_args+=(--use-system-electron --system-electron-bin "${_system_electron_bin}")
+  fi
+  if [[ "${_keep_updater}" == "1" ]]; then
+    _build_args+=(--keep-updater)
+  fi
+  if [[ "${_keep_cloud}" == "1" ]]; then
+    _build_args+=(--keep-cloud)
+  fi
+
+  python3 "${_repo_root}/t3clean.py" build "${_build_args[@]}"
+
+  if [[ "${_build_deb}" == "1" ]]; then
+    local _deb_out="${T3CLEAN_DEB_OUT_DIR:-${srcdir}/out-deb}"
+    local _deb_args=(
+      --source "${srcdir}/t3code"
+      --skip-fetch
+      --skip-patch
+      --skip-install
+      --skip-verify
+      --target desktop-deb
+      --arch "${_arch}"
+      --version "${_build_ver}"
+      --output-dir "${_deb_out}"
+      --cache-dir "${_cache_dir}"
+    )
+    if [[ "${_keep_updater}" == "1" ]]; then
+      _deb_args+=(--keep-updater)
+    fi
+    if [[ "${_keep_cloud}" == "1" ]]; then
+      _deb_args+=(--keep-cloud)
+    fi
+    python3 "${_repo_root}/t3clean.py" build "${_deb_args[@]}"
+  fi
+}
+
+check() {
+  local _repo_root _artifact_dir
+  _repo_root="$(_t3clean_repo_root)"
+  if [[ "${_use_system_electron}" == "1" ]]; then
+    _artifact_dir="${srcdir}/out/linux-system-electron"
+  else
+    _artifact_dir="$(find "${srcdir}/out" -maxdepth 1 -type d -name 'linux*-unpacked' -print -quit)"
+  fi
+  if [[ -z "${_artifact_dir}" || ! -d "${_artifact_dir}" ]]; then
+    echo "ERROR: Built desktop artifact directory not found under ${srcdir}/out" >&2
+    return 1
+  fi
+
+  local _verify_args=(--artifact "${_artifact_dir}")
+  if [[ "${_keep_updater}" == "1" ]]; then
+    _verify_args+=(--keep-updater)
+  fi
+  if [[ "${_strict_offline}" == "1" ]]; then
+    _verify_args+=(--strict-offline)
+  fi
+  python3 "${_repo_root}/t3clean.py" verify "${_verify_args[@]}"
+}
+
+package() {
+  local _payload_dir
+  if [[ "${_use_system_electron}" == "1" ]]; then
+    _payload_dir="${srcdir}/out/linux-system-electron"
+  else
+    _payload_dir="$(find "${srcdir}/out" -maxdepth 1 -type d -name 'linux*-unpacked' -print -quit)"
+  fi
+  if [[ -z "${_payload_dir}" || ! -d "${_payload_dir}" ]]; then
+    echo "ERROR: Packaged payload directory missing under ${srcdir}/out" >&2
+    return 1
+  fi
+
+  install -d "${pkgdir}/usr/lib/${pkgname}"
+  cp -a "${_payload_dir}/." "${pkgdir}/usr/lib/${pkgname}/"
+  if [[ "${_use_system_electron}" == "1" ]]; then
+    printf '%s\n' "${_system_electron_bin}" > "${pkgdir}/usr/lib/${pkgname}/.use-system-electron"
+  fi
+  chmod -R a+rX "${pkgdir}/usr/lib/${pkgname}"
+
+  install -Dm755 "${srcdir}/t3-code-no-telemetry.sh" "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm644 "${srcdir}/t3-code-no-telemetry.desktop" \
+    "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+
+  local _icon_src="${srcdir}/t3code/assets/prod/black-universal-1024.png"
+  if [[ -f "${_icon_src}" ]]; then
+    local _resize_tool=""
+    if command -v magick >/dev/null 2>&1; then
+      _resize_tool="magick"
+    elif command -v convert >/dev/null 2>&1; then
+      _resize_tool="convert"
+    fi
+    local _size
+    for _size in 16 22 24 32 48 64 128 256 512; do
+      install -d "${pkgdir}/usr/share/icons/hicolor/${_size}x${_size}/apps"
+      if [[ -n "${_resize_tool}" ]]; then
+        "${_resize_tool}" "${_icon_src}" -resize "${_size}x${_size}" \
+          "${pkgdir}/usr/share/icons/hicolor/${_size}x${_size}/apps/${pkgname}.png"
+      elif [[ "${_size}" == "512" ]]; then
+        install -Dm644 "${_icon_src}" \
+          "${pkgdir}/usr/share/icons/hicolor/${_size}x${_size}/apps/${pkgname}.png"
+      fi
+    done
+    if [[ -f "${pkgdir}/usr/share/icons/hicolor/512x512/apps/${pkgname}.png" ]]; then
+      install -Dm644 "${pkgdir}/usr/share/icons/hicolor/512x512/apps/${pkgname}.png" \
+        "${pkgdir}/usr/share/pixmaps/${pkgname}.png"
+    else
+      install -Dm644 "${_icon_src}" "${pkgdir}/usr/share/pixmaps/${pkgname}.png"
+    fi
+  fi
+
+  install -Dm644 "${srcdir}/t3code/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

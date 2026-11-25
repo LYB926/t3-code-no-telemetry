@@ -232,6 +232,7 @@ class TestCliAndAur(unittest.TestCase):
         ).stdout
         for flag in (
             "--bootstrap-toolchain",
+            "--jobs",
             "--use-system-electron",
             "--system-electron-bin",
             "--cache-dir",
@@ -375,6 +376,8 @@ class TestCliAndAur(unittest.TestCase):
         self.assertNotIn("git+https://", pkgbuild_text)
         self.assertIn("archive/refs/tags/", pkgbuild_text)
         self.assertIn("--bootstrap-toolchain", pkgbuild_text)
+        self.assertIn('_jobs="${T3CLEAN_JOBS:-}"', pkgbuild_text)
+        self.assertIn('--jobs "${_jobs}"', pkgbuild_text)
         self.assertNotIn("conflicts=('t3code-bin')", pkgbuild_text)
         self.assertNotIn('conflicts=("t3code-bin")', pkgbuild_text)
         self.assertIn('_build_deb="${T3CLEAN_BUILD_DEB:-0}"', pkgbuild_text)
@@ -458,6 +461,9 @@ class TestCliAndAur(unittest.TestCase):
                 pkgbuild,
             )
             self.assertIn("_t3clean_ensure_vp", pkgbuild)
+            self.assertIn("_t3clean_apply_memory_guards", pkgbuild)
+            self.assertIn("T3CLEAN_JOBS", pkgbuild)
+            self.assertIn("GIT_CEILING_DIRECTORIES", pkgbuild)
             self.assertIn("pkgrel=2", pkgbuild)
             self.assertIn('python3 "${srcdir}/t3clean-standalone.py"', pkgbuild)
 
@@ -641,12 +647,13 @@ class TestCliAndAur(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 self.assertEqual(captured[-1].version, "0.1.12+custom")
 
-                # 3. --skip-fetch leaves version=None so builder reads source metadata
+                # 3. --skip-fetch leaves version=None so builder reads source metadata, and --jobs propagates
                 fake_fetch.reset_mock()
-                rc = cli_mod.main(["build", "--source", str(src_dir), "--skip-fetch"])
+                rc = cli_mod.main(["build", "--source", str(src_dir), "--skip-fetch", "--jobs", "3"])
                 self.assertEqual(rc, 0)
                 fake_fetch.assert_not_called()
                 self.assertIsNone(captured[-1].version)
+                self.assertEqual(captured[-1].jobs, 3)
 
 
 if __name__ == "__main__":

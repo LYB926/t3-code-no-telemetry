@@ -186,6 +186,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         version=resolved_version,
         output_dir=Path(args.output_dir).expanduser().resolve() if args.output_dir else None,
         cache_dir=Path(args.cache_dir).expanduser().resolve() if args.cache_dir else None,
+        jobs=args.jobs,
         bootstrap_toolchain=bool(args.bootstrap_toolchain),
         use_system_electron=bool(args.use_system_electron),
         system_electron_bin=args.system_electron_bin,
@@ -430,6 +431,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-dir",
         default=None,
         help="Optional persistent cache directory for Electron/Cargo/pnpm caches.",
+    )
+    p_build.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="Limit Rust/Rolldown/npm build concurrency (default: auto-throttled on <=16 GiB RAM; also respects T3CLEAN_JOBS).",
     )
     p_build.add_argument(
         "--bootstrap-toolchain",

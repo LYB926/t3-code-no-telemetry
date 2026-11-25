@@ -111,6 +111,22 @@ T3CLEAN_CACHE_DIR="${HOME}/.cache/t3-code-no-telemetry" makepkg -si
 | `T3CLEAN_KEEP_UPDATER` | `0` | 设为 `1` 时保留桌面端自动更新策略 |
 | `T3CLEAN_KEEP_CLOUD` | `0` | 设为 `1` 时保留 Clerk / T3 Connect 云端配置 |
 | `T3CLEAN_STRICT_OFFLINE` | `0` | 设为 `1` 时在 `check()` 阶段启用 `--strict-offline` 校验 |
+| `T3CLEAN_JOBS` | 自动 | 手动指定 Rust / Rolldown / npm 编译并发数（如 `T3CLEAN_JOBS=4`，对应 CLI `--jobs 4`）；不设置时仅在 `≤ 16 GiB` 内存或可用内存偏紧时自动降并发，32/64 GiB 高配机保持全速 |
+
+### 低内存机器（16 GiB 及以下）防卡死编译建议
+
+前端打包（Vite+/Rolldown + React Compiler + Tailwind Oxide）与 Rust 原生组件（`t3-resource-monitor`）在并发拉满时会产生较高的原生堆内存峰值。构建器默认采取 **“自适应限并发 + 低内存预警”** 策略（不在脚本里硬编码 `MemoryMax` 或 `ulimit -v`，以保证 clean-chroot / Docker / CI 兼容性且避免误杀正常构建）：
+
+- **自动降并发**：当检测到宿主机物理内存 `≤ 16 GiB`（或可用内存 `< 6 GiB`）且用户未手动指定并发环境变量时，自动设置 `RAYON_NUM_THREADS`、`CARGO_BUILD_JOBS`（默认收敛至 `4`；`≤ 10 GiB` 或 `< 4 GiB` 可用时收敛至 `2`）与 `npm_config_child_concurrency`（`1~2`）；随时可通过 `--jobs N` / `T3CLEAN_JOBS=N` 或显式环境变量覆盖。
+- **低内存预警**：编译前若 `/proc/meminfo` 显示 `MemAvailable < 6 GiB`（尤其仅有 zram 无磁盘 swap），会在 stderr 打印友好提示（不中断构建）。
+- **16 GiB 桌面端强保护（可选）**：如果在纯 zram、未启用 `systemd-oomd`/`earlyoom` 的桌面环境下编译，建议先关掉占内存的浏览器/Electron 应用，并用 `systemd-run` 给构建进程树套一个 cgroup 内存上限（就算爆内存也只杀编译进程，绝不拖死桌面）：
+
+```bash
+cd packaging/arch
+T3CLEAN_CACHE_DIR="${HOME}/.cache/t3-code-no-telemetry" \
+systemd-run --user --scope -p MemoryHigh=8G -p MemoryMax=10G \
+  makepkg -Csi
+```
 
 示例（使用持久化缓存、构建 `main` 分支、额外输出 `.deb` 并使用系统 Electron）：
 

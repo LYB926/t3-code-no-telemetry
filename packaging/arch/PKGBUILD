@@ -22,6 +22,7 @@ _system_electron_bin="${T3CLEAN_SYSTEM_ELECTRON_BIN:-electron}"
 _keep_updater="${T3CLEAN_KEEP_UPDATER:-0}"
 _keep_cloud="${T3CLEAN_KEEP_CLOUD:-0}"
 _strict_offline="${T3CLEAN_STRICT_OFFLINE:-0}"
+_jobs="${T3CLEAN_JOBS:-}"
 
 # Coexists cleanly with t3code-bin (no conflicts/provides overlap).
 # Shares user state (~/.t3/userdata/ and ~/.config/t3code-v2/) while using
@@ -212,6 +213,9 @@ build() {
   if [[ "${_use_system_electron}" == "1" ]]; then
     _build_args+=(--use-system-electron --system-electron-bin "${_system_electron_bin}")
   fi
+  if [[ -n "${_jobs}" ]]; then
+    _build_args+=(--jobs "${_jobs}")
+  fi
   if [[ "${_keep_updater}" == "1" ]]; then
     _build_args+=(--keep-updater)
   fi
@@ -236,6 +240,9 @@ build() {
       --output-dir "${_deb_out}"
       --cache-dir "${_cache_dir}"
     )
+    if [[ -n "${_jobs}" ]]; then
+      _deb_args+=(--jobs "${_jobs}")
+    fi
     if [[ "${_keep_updater}" == "1" ]]; then
       _deb_args+=(--keep-updater)
     fi

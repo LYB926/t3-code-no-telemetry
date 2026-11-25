@@ -24,6 +24,17 @@ from .verifier import VerifyOptions, verify_artifact
 MIN_VP_VERSION: tuple[int, int, int] = (1, 4, 0)
 _SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
+LOW_TOTAL_MEM_MIB: int = 16 * 1024 + 512
+VERY_LOW_TOTAL_MEM_MIB: int = 10 * 1024
+LOW_AVAILABLE_WARN_MIB: int = 6 * 1024
+VERY_LOW_AVAILABLE_MIB: int = 4 * 1024
+
+CONCURRENCY_ENV_KEYS: tuple[str, ...] = (
+    "RAYON_NUM_THREADS",
+    "CARGO_BUILD_JOBS",
+    "npm_config_child_concurrency",
+)
+
 VALID_TARGETS: tuple[str, ...] = (
     "desktop-dir",
     "desktop-deb",
@@ -56,6 +67,16 @@ SCRUB_ENV_EXACT: frozenset[str] = frozenset(
 
 
 @dataclass(frozen=True)
+class HostMemoryInfo:
+    """Snapshot of host memory and swap layout from ``/proc``."""
+
+    total_mib: int | None = None
+    available_mib: int | None = None
+    has_disk_swap: bool = False
+    has_zram_swap: bool = False
+
+
+@dataclass(frozen=True)
 class BuildOptions:
     """Configuration options for building a de-telemetrized T3 Code artifact."""
 
@@ -65,6 +86,7 @@ class BuildOptions:
     version: str | None = None
     output_dir: Path | None = None
     cache_dir: Path | None = None
+    jobs: int | None = None
     bootstrap_toolchain: bool = False
     use_system_electron: bool = False
     system_electron_bin: str = "electron"
@@ -75,6 +97,186 @@ class BuildOptions:
     keep_cloud: bool = False
     strict_offline: bool = False
     skip_patch: bool = True
+
+
+def read_host_memory_info(
+    *,
+    meminfo_path: Path = Path("/proc/meminfo"),
+    swaps_path: Path = Path("/proc/swaps"),
+) -> HostMemoryInfo:
+    """Read Linux ``/proc/meminfo`` and ``/proc/swaps`` best-effort without raising."""
+    total_mib: int | None = None
+    available_mib: int | None = None
+    try:
+        meminfo_text = meminfo_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        meminfo_text = ""
+
+    for line in meminfo_text.splitlines():
+        if line.startswith("MemTotal:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                total_mib = int(parts[1]) // 1024
+        elif line.startswith("MemAvailable:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                available_mib = int(parts[1]) // 1024
+
+    has_disk_swap = False
+    has_zram_swap = False
+    try:
+        swaps_text = swaps_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        swaps_text = ""
+
+    for line in swaps_text.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        device = stripped.split()[0]
+        if device.startswith("/dev/zram") or "/zram" in device:
+            has_zram_swap = True
+        else:
+            has_disk_swap = True
+
+    return HostMemoryInfo(
+        total_mib=total_mib,
+        available_mib=available_mib,
+        has_disk_swap=has_disk_swap,
+        has_zram_swap=has_zram_swap,
+    )
+
+
+def compute_adaptive_concurrency(
+    mem_info: HostMemoryInfo,
+    *,
+    explicit_jobs: int | None = None,
+    cpu_count: int | None = None,
+) -> dict[str, str]:
+    """Compute Rust/Rolldown/npm concurrency limits for explicit ``jobs`` or low-RAM hosts.
+
+    Returns an empty dict on high-memory hosts (> 16 GiB RAM with >= 6 GiB available)
+    so 32/64 GiB workstations keep full build speed.
+    """
+    if explicit_jobs is not None:
+        if explicit_jobs < 1:
+            raise ValueError(f"jobs must be >= 1, got {explicit_jobs}")
+        return {
+            "RAYON_NUM_THREADS": str(explicit_jobs),
+            "CARGO_BUILD_JOBS": str(explicit_jobs),
+            "npm_config_child_concurrency": str(max(1, min(explicit_jobs, 4))),
+        }
+
+    total = mem_info.total_mib
+    avail = mem_info.available_mib
+    if total is None and avail is None:
+        return {}
+
+    cpus = max(1, cpu_count if cpu_count is not None else (os.cpu_count() or 4))
+
+    if (total is not None and total <= VERY_LOW_TOTAL_MEM_MIB) or (
+        avail is not None and avail < VERY_LOW_AVAILABLE_MIB
+    ):
+        jobs = max(1, min(2, cpus))
+        child_concurrency = 1
+    elif (total is not None and total <= LOW_TOTAL_MEM_MIB) or (
+        avail is not None and avail < LOW_AVAILABLE_WARN_MIB
+    ):
+        jobs = max(1, min(4, cpus))
+        child_concurrency = max(1, min(2, jobs))
+    else:
+        return {}
+
+    return {
+        "RAYON_NUM_THREADS": str(jobs),
+        "CARGO_BUILD_JOBS": str(jobs),
+        "npm_config_child_concurrency": str(child_concurrency),
+    }
+
+
+def _resolve_explicit_jobs(options_jobs: int | None, env: Mapping[str, str]) -> int | None:
+    """Resolve explicit concurrency override from ``BuildOptions.jobs`` or ``T3CLEAN_JOBS``."""
+    if options_jobs is not None:
+        if options_jobs < 1:
+            raise ValueError(f"jobs must be >= 1, got {options_jobs}")
+        return options_jobs
+    raw = env.get("T3CLEAN_JOBS", "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"T3CLEAN_JOBS must be a positive integer, got {raw!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"T3CLEAN_JOBS must be >= 1, got {parsed}")
+    return parsed
+
+
+def apply_concurrency_env(
+    env: dict[str, str],
+    mem_info: HostMemoryInfo,
+    *,
+    explicit_jobs: int | None = None,
+    cpu_count: int | None = None,
+) -> dict[str, str]:
+    """Apply explicit or adaptive concurrency limits into ``env`` and return effective settings.
+
+    When ``explicit_jobs`` is ``None`` (auto-adaptive mode), existing user-set values for
+    ``RAYON_NUM_THREADS``, ``CARGO_BUILD_JOBS``, or ``npm_config_child_concurrency`` are
+    preserved via ``setdefault``.
+    """
+    desired = compute_adaptive_concurrency(
+        mem_info,
+        explicit_jobs=explicit_jobs,
+        cpu_count=cpu_count,
+    )
+    if not desired:
+        return {}
+
+    applied: dict[str, str] = {}
+    for key, value in desired.items():
+        if explicit_jobs is not None:
+            env[key] = value
+            applied[key] = value
+        else:
+            effective = env.setdefault(key, value)
+            applied[key] = effective
+    return applied
+
+
+def format_low_memory_warning(
+    mem_info: HostMemoryInfo,
+    *,
+    applied_limits: Mapping[str, str] | None = None,
+) -> str | None:
+    """Return a non-blocking low-memory advisory string when ``MemAvailable < 6 GiB``."""
+    avail = mem_info.available_mib
+    if avail is None or avail >= LOW_AVAILABLE_WARN_MIB:
+        return None
+
+    avail_gib = avail / 1024.0
+    if mem_info.total_mib is not None:
+        mem_desc = f"{avail_gib:.1f} GiB available / {mem_info.total_mib / 1024.0:.1f} GiB total"
+    else:
+        mem_desc = f"{avail_gib:.1f} GiB available"
+
+    swap_note = ""
+    if mem_info.has_zram_swap and not mem_info.has_disk_swap:
+        swap_note = " (zram-only swap detected, no disk swap — high risk of desktop thrashing)"
+    elif not mem_info.has_zram_swap and not mem_info.has_disk_swap:
+        swap_note = " (no swap detected)"
+
+    limits_note = ""
+    if applied_limits:
+        pairs = ", ".join(f"{k}={v}" for k, v in applied_limits.items())
+        limits_note = f" Active concurrency limits: {pairs}."
+
+    return (
+        f"WARNING: Low available memory before build: {mem_desc}{swap_note}.{limits_note} "
+        "Consider closing heavy browsers/Electron apps, or wrap the build with "
+        "'systemd-run --user --scope -p MemoryHigh=8G -p MemoryMax=10G ...' "
+        "(see README.md)."
+    )
 
 
 def sanitized_build_env(
@@ -720,6 +922,27 @@ def build_target(options: BuildOptions) -> Path:
         cache_dir=options.cache_dir,
         sourcemap=options.sourcemap,
     )
+    # Prevent git/vp prepare hooks inside a tarball build dir from walking up
+    # and mutating an enclosing git repository's .git/config (e.g. core.hooksPath).
+    ceiling_dir = str(source_dir.parent)
+    existing_ceiling = env.get("GIT_CEILING_DIRECTORIES", "")
+    if ceiling_dir not in existing_ceiling.split(os.pathsep):
+        env["GIT_CEILING_DIRECTORIES"] = (
+            f"{existing_ceiling}{os.pathsep}{ceiling_dir}" if existing_ceiling else ceiling_dir
+        )
+    explicit_jobs = _resolve_explicit_jobs(options.jobs, env)
+    mem_info = read_host_memory_info()
+    applied_limits = apply_concurrency_env(env, mem_info, explicit_jobs=explicit_jobs)
+    if applied_limits and explicit_jobs is None:
+        limit_summary = ", ".join(f"{k}={v}" for k, v in applied_limits.items())
+        print(
+            f"NOTE: Auto-throttled build concurrency for tight memory ({limit_summary}; "
+            "override via --jobs / T3CLEAN_JOBS or explicit env vars).",
+            file=sys.stderr,
+        )
+    low_mem_warning = format_low_memory_warning(mem_info, applied_limits=applied_limits)
+    if low_mem_warning is not None:
+        print(low_mem_warning, file=sys.stderr)
     if options.cache_dir is not None:
         for cache_key in (
             "ELECTRON_CACHE",

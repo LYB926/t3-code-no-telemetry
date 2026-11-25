@@ -365,6 +365,7 @@ _system_electron_bin="${{T3CLEAN_SYSTEM_ELECTRON_BIN:-electron}}"
 _keep_updater="${{T3CLEAN_KEEP_UPDATER:-0}}"
 _keep_cloud="${{T3CLEAN_KEEP_CLOUD:-0}}"
 _strict_offline="${{T3CLEAN_STRICT_OFFLINE:-0}}"
+_jobs="${{T3CLEAN_JOBS:-}}"
 
 {depends_block}
 if [[ "${{_use_system_electron}}" == "1" ]]; then
@@ -489,6 +490,67 @@ _t3clean_scrub_env() {{
   export XDG_CACHE_HOME="${{_cache_dir}}/xdg"
 }}
 
+_t3clean_apply_memory_guards() {{
+  local _mem_total_kb="" _mem_avail_kb="" _mem_total_mib=0 _mem_avail_mib=0
+  if [[ -r /proc/meminfo ]]; then
+    _mem_total_kb="$(awk '/^MemTotal:/ {{print $2; exit}}' /proc/meminfo)"
+    _mem_avail_kb="$(awk '/^MemAvailable:/ {{print $2; exit}}' /proc/meminfo)"
+    [[ -n "${{_mem_total_kb}}" ]] && _mem_total_mib=$(( _mem_total_kb / 1024 ))
+    [[ -n "${{_mem_avail_kb}}" ]] && _mem_avail_mib=$(( _mem_avail_kb / 1024 ))
+  fi
+
+  local _has_zram=0 _has_disk_swap=0 _swap_dev=""
+  if [[ -r /proc/swaps ]]; then
+    while read -r _swap_dev _; do
+      [[ -z "${{_swap_dev}}" || "${{_swap_dev}}" == "Filename" ]] && continue
+      if [[ "${{_swap_dev}}" == /dev/zram* ]]; then
+        _has_zram=1
+      else
+        _has_disk_swap=1
+      fi
+    done < /proc/swaps
+  fi
+
+  local _cpus
+  _cpus="$(nproc 2>/dev/null || echo 4)"
+  local _target_jobs="" _target_child=""
+  if [[ -n "${{_jobs}}" ]]; then
+    if ! [[ "${{_jobs}}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: T3CLEAN_JOBS must be a positive integer, got '${{_jobs}}'" >&2
+      return 1
+    fi
+    _target_jobs="${{_jobs}}"
+    _target_child=$(( _jobs < 4 ? _jobs : 4 ))
+    export RAYON_NUM_THREADS="${{_target_jobs}}"
+    export CARGO_BUILD_JOBS="${{_target_jobs}}"
+    export npm_config_child_concurrency="${{_target_child}}"
+  elif (( _mem_total_mib > 0 || _mem_avail_mib > 0 )); then
+    if (( (_mem_total_mib > 0 && _mem_total_mib <= 10240) || (_mem_avail_mib > 0 && _mem_avail_mib < 4096) )); then
+      _target_jobs=$(( _cpus < 2 ? _cpus : 2 ))
+      _target_child=1
+    elif (( (_mem_total_mib > 0 && _mem_total_mib <= 16896) || (_mem_avail_mib > 0 && _mem_avail_mib < 6144) )); then
+      _target_jobs=$(( _cpus < 4 ? _cpus : 4 ))
+      _target_child=$(( _target_jobs < 2 ? _target_jobs : 2 ))
+    fi
+    if [[ -n "${{_target_jobs}}" ]]; then
+      export RAYON_NUM_THREADS="${{RAYON_NUM_THREADS:-${{_target_jobs}}}}"
+      export CARGO_BUILD_JOBS="${{CARGO_BUILD_JOBS:-${{_target_jobs}}}}"
+      export npm_config_child_concurrency="${{npm_config_child_concurrency:-${{_target_child}}}}"
+      echo "NOTE: Auto-throttled build concurrency for tight memory (RAYON_NUM_THREADS=${{RAYON_NUM_THREADS}}, CARGO_BUILD_JOBS=${{CARGO_BUILD_JOBS}}, npm_config_child_concurrency=${{npm_config_child_concurrency}}; override with T3CLEAN_JOBS)." >&2
+    fi
+  fi
+
+  if (( _mem_avail_mib > 0 && _mem_avail_mib < 6144 )); then
+    local _swap_note=""
+    if (( _has_zram == 1 && _has_disk_swap == 0 )); then
+      _swap_note=" (zram-only swap detected, no disk swap)"
+    elif (( _has_zram == 0 && _has_disk_swap == 0 )); then
+      _swap_note=" (no swap detected)"
+    fi
+    echo "WARNING: Low available memory (~$(( _mem_avail_mib / 1024 )).$(( (_mem_avail_mib % 1024) * 10 / 1024 )) GiB / ~$(( _mem_total_mib / 1024 )).$(( (_mem_total_mib % 1024) * 10 / 1024 )) GiB)${{_swap_note}}. Close heavy desktop apps or wrap the build with 'systemd-run --user --scope -p MemoryHigh=8G -p MemoryMax=10G ...' to avoid desktop freezes." >&2
+  fi
+}}
+
 prepare() {{
   local _src_dir
   _src_dir="$(_t3clean_source_dir)"
@@ -507,7 +569,9 @@ build() {{
   _src_dir="$(_t3clean_source_dir)"
   cd "${{_src_dir}}"
   rm -f .env .env.local
+  export GIT_CEILING_DIRECTORIES="${{GIT_CEILING_DIRECTORIES:+${{GIT_CEILING_DIRECTORIES}}:}}$(dirname "${{_src_dir}}")"
   _t3clean_scrub_env
+  _t3clean_apply_memory_guards
   _t3clean_ensure_vp
 
   local _arch _build_ver

@@ -17,9 +17,14 @@ from unittest import mock
 from t3clean import DEFAULT_NODE_VERSION
 from t3clean.builder import (
     BuildOptions,
+    HostMemoryInfo,
     VALID_TARGETS,
+    apply_concurrency_env,
     build_target,
+    compute_adaptive_concurrency,
     ensure_isolated_toolchain,
+    format_low_memory_warning,
+    read_host_memory_info,
     sanitized_build_env,
 )
 from t3clean.source import (
@@ -646,6 +651,154 @@ class BuilderTests(unittest.TestCase):
                 self.assertTrue(bool(wrapper_info.mode & stat.S_IXUSR))
                 wrapper_text = tar.extractfile(wrapper_info).read().decode("utf-8")
                 self.assertIn('exec "$DIR/node/bin/node" "$DIR/dist/bin.mjs" "$@"', wrapper_text)
+
+    def test_read_host_memory_info_parses_meminfo_and_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meminfo = root / "meminfo"
+            swaps = root / "swaps"
+            meminfo.write_text(
+                "MemTotal:       15518924 kB\n"
+                "MemFree:          123456 kB\n"
+                "MemAvailable:    4718592 kB\n",
+                encoding="utf-8",
+            )
+            swaps.write_text(
+                "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
+                "/dev/zram0                              partition\t15518716\t0\t\t100\n",
+                encoding="utf-8",
+            )
+            info = read_host_memory_info(meminfo_path=meminfo, swaps_path=swaps)
+            self.assertEqual(info.total_mib, 15518924 // 1024)
+            self.assertEqual(info.available_mib, 4718592 // 1024)
+            self.assertTrue(info.has_zram_swap)
+            self.assertFalse(info.has_disk_swap)
+
+            # Adding a disk swapfile flips has_disk_swap to True.
+            swaps.write_text(
+                "Filename Type Size Used Priority\n"
+                "/dev/zram0 partition 15518716 0 100\n"
+                "/swapfile file 8388604 0 10\n",
+                encoding="utf-8",
+            )
+            info2 = read_host_memory_info(meminfo_path=meminfo, swaps_path=swaps)
+            self.assertTrue(info2.has_zram_swap)
+            self.assertTrue(info2.has_disk_swap)
+
+            # Missing /proc files return safe empty snapshot without raising.
+            missing = read_host_memory_info(
+                meminfo_path=root / "nonexistent-meminfo",
+                swaps_path=root / "nonexistent-swaps",
+            )
+            self.assertEqual(missing, HostMemoryInfo())
+
+    def test_adaptive_concurrency_and_low_memory_warning(self) -> None:
+        # 1. 32 GiB workstation with ample available RAM -> no throttling, no warning.
+        high_mem = HostMemoryInfo(total_mib=32 * 1024, available_mib=20 * 1024, has_disk_swap=True)
+        self.assertEqual(compute_adaptive_concurrency(high_mem, cpu_count=16), {})
+        self.assertIsNone(format_low_memory_warning(high_mem))
+
+        # 2. 16 GiB laptop (14.8 GiB usable with iGPU) -> throttle to 4/4/2; preserves user overrides.
+        mid_mem = HostMemoryInfo(total_mib=15155, available_mib=7 * 1024, has_zram_swap=True)
+        self.assertEqual(
+            compute_adaptive_concurrency(mid_mem, cpu_count=12),
+            {
+                "RAYON_NUM_THREADS": "4",
+                "CARGO_BUILD_JOBS": "4",
+                "npm_config_child_concurrency": "2",
+            },
+        )
+        self.assertIsNone(format_low_memory_warning(mid_mem))
+
+        env_auto = {"CARGO_BUILD_JOBS": "6"}
+        applied = apply_concurrency_env(env_auto, mid_mem, explicit_jobs=None, cpu_count=12)
+        self.assertEqual(applied["CARGO_BUILD_JOBS"], "6")
+        self.assertEqual(applied["RAYON_NUM_THREADS"], "4")
+        self.assertEqual(applied["npm_config_child_concurrency"], "2")
+
+        # 3. Very low RAM (8 GiB or <4 GiB available) -> throttle to 2/2/1 + zram-only warning.
+        low_mem = HostMemoryInfo(total_mib=15155, available_mib=3 * 1024 + 512, has_zram_swap=True)
+        self.assertEqual(
+            compute_adaptive_concurrency(low_mem, cpu_count=12),
+            {
+                "RAYON_NUM_THREADS": "2",
+                "CARGO_BUILD_JOBS": "2",
+                "npm_config_child_concurrency": "1",
+            },
+        )
+        warn = format_low_memory_warning(
+            low_mem,
+            applied_limits={"RAYON_NUM_THREADS": "2", "CARGO_BUILD_JOBS": "2"},
+        )
+        self.assertIsNotNone(warn)
+        assert warn is not None
+        self.assertIn("zram-only swap detected", warn)
+        self.assertIn("systemd-run", warn)
+        self.assertIn("RAYON_NUM_THREADS=2", warn)
+
+        # 4. Explicit jobs override ignores high-RAM bypass and overwrites existing env.
+        env_explicit = {"CARGO_BUILD_JOBS": "12", "RAYON_NUM_THREADS": "12"}
+        applied_explicit = apply_concurrency_env(env_explicit, high_mem, explicit_jobs=3, cpu_count=16)
+        self.assertEqual(
+            applied_explicit,
+            {
+                "RAYON_NUM_THREADS": "3",
+                "CARGO_BUILD_JOBS": "3",
+                "npm_config_child_concurrency": "3",
+            },
+        )
+        with self.assertRaises(ValueError):
+            compute_adaptive_concurrency(high_mem, explicit_jobs=0)
+
+    def test_build_target_applies_adaptive_concurrency_and_emits_low_memory_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            out = root / "out"
+            src.mkdir()
+            captured_envs: list[dict[str, str]] = []
+
+            def fake_run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> None:
+                captured_envs.append(dict(env))
+                unpacked = out / "linux-unpacked"
+                (unpacked / "resources").mkdir(parents=True, exist_ok=True)
+                (unpacked / "t3code").write_bytes(b"bin")
+                (unpacked / "resources" / "app.asar").write_bytes(b"clean")
+
+            tight_mem = HostMemoryInfo(total_mib=15155, available_mib=4 * 1024 + 512, has_zram_swap=True)
+            stderr_buf = io.StringIO()
+            clean_base_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("RAYON_NUM_THREADS", "CARGO_BUILD_JOBS", "npm_config_child_concurrency", "T3CLEAN_JOBS")
+            }
+            with (
+                mock.patch.dict(os.environ, clean_base_env, clear=True),
+                mock.patch("t3clean.builder.read_host_memory_info", return_value=tight_mem),
+                mock.patch("t3clean.builder.os.cpu_count", return_value=12),
+                mock.patch("t3clean.builder._run_cmd", side_effect=fake_run),
+                mock.patch("sys.stderr", stderr_buf),
+            ):
+                build_target(
+                    BuildOptions(
+                        source_dir=src,
+                        target="desktop-dir",
+                        version="0.1.12+notelemetry",
+                        output_dir=out,
+                        skip_install=True,
+                        skip_verify=True,
+                    )
+                )
+
+            self.assertEqual(len(captured_envs), 1)
+            self.assertEqual(captured_envs[0]["RAYON_NUM_THREADS"], "4")
+            self.assertEqual(captured_envs[0]["CARGO_BUILD_JOBS"], "4")
+            self.assertEqual(captured_envs[0]["npm_config_child_concurrency"], "2")
+            self.assertIn(str(src.resolve().parent), captured_envs[0]["GIT_CEILING_DIRECTORIES"].split(os.pathsep))
+            stderr_text = stderr_buf.getvalue()
+            self.assertIn("Auto-throttled build concurrency", stderr_text)
+            self.assertIn("WARNING: Low available memory", stderr_text)
+            self.assertIn("zram-only swap detected", stderr_text)
 
 
 if __name__ == "__main__":

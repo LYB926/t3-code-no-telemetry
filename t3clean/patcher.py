@@ -1,6 +1,7 @@
 """Deterministic, idempotent de-telemetry & build-safety source patcher for T3 Code.
 
-Applies 6 targeted de-telemetry rules plus 1 Tailwind CSS v4 source-scan guard
+Applies 6 targeted de-telemetry rules plus build-compatibility guards
+(Tailwind CSS v4 source-scan exclusion and host-aware Linux glibc ceiling)
 across upstream v0.1.11, v0.1.12, and main while keeping model manifest and
 usage pricing services intact (rules 7 & 8).
 """
@@ -578,6 +579,27 @@ def _patch_web_tailwind_source_ignore(original: str) -> tuple[str, str]:
     )
 
 
+def _patch_linux_glibc_ceiling(original: str) -> tuple[str, str]:
+    """Build-compatibility rule: Allow overriding upstream's hardcoded 2.39 glibc ceiling.
+
+    Upstream CI builds on Ubuntu 24.04 (glibc 2.39) and rejects newer glibc
+    symbols in electron-builder's afterPack hook. Rolling distros (Arch/CachyOS,
+    Fedora, Debian 13+) link locally built native addons (e.g. node-pty) against
+    newer host glibc symbols. Replacing the literal with an env-overridable
+    ceiling keeps readelf scanning and .deb libc6 dependency calculation intact.
+    """
+    updated = _ts_replace_const_declaration(
+        original,
+        re.compile(r"^[ \t]*const\s+GLIBC_BUILD_CEILING\b", re.MULTILINE),
+        replacement='const GLIBC_BUILD_CEILING = process.env.T3CODE_GLIBC_BUILD_CEILING?.trim() || "99.0";',
+        anchor_desc="[linux-glibc-ceiling] scripts/linux-glibc.ts: const GLIBC_BUILD_CEILING",
+    )
+    return (
+        _patch_prepend_marker(updated),
+        "made GLIBC_BUILD_CEILING configurable via T3CODE_GLIBC_BUILD_CEILING",
+    )
+
+
 def _patch_analytics_service(original: str) -> tuple[str, str]:
     """Rule 1: Replace AnalyticsService.ts with a zero-network Effect no-op stub."""
     required_anchors = (
@@ -1053,6 +1075,16 @@ def patch_source_tree(
             _patch_web_tailwind_source_ignore,
         ),
     ]
+
+    # Present in v0.1.12+/main; gracefully skipped on older tags (e.g. v0.1.11) without the file.
+    if (root / "scripts/linux-glibc.ts").is_file():
+        plan.append(
+            (
+                "linux-glibc-ceiling",
+                "scripts/linux-glibc.ts",
+                _patch_linux_glibc_ceiling,
+            )
+        )
 
     if not opts.keep_updater:
         plan.append(

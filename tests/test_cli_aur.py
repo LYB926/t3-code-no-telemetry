@@ -140,6 +140,10 @@ def _write_mock_upstream_tree(root: Path) -> None:
             '@layer theme, base, clerk, components, utilities;\n'
             '@import "tailwindcss";\n'
         ),
+        "scripts/linux-glibc.ts": (
+            'const GLIBC_BUILD_CEILING = "2.39";\n'
+            'export const scanGlibcNeeds = async () => ({ minimum: GLIBC_BUILD_CEILING, elfCount: 1 });\n'
+        ),
         "apps/desktop/src/updates/DesktopUpdatePolicy.ts": (
             'export interface UpdatePolicy {\n'
             '  readonly mode: string;\n'
@@ -468,6 +472,7 @@ class TestCliAndAur(unittest.TestCase):
             self.assertIn("_t3clean_apply_memory_guards", pkgbuild)
             self.assertIn("T3CLEAN_JOBS", pkgbuild)
             self.assertIn("GIT_CEILING_DIRECTORIES", pkgbuild)
+            self.assertIn("T3CODE_GLIBC_BUILD_CEILING", pkgbuild)
             self.assertIn("pkgrel=2", pkgbuild)
             self.assertIn('python3 "${srcdir}/t3clean-standalone.py"', pkgbuild)
 

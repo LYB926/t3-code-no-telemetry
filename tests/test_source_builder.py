@@ -22,6 +22,7 @@ from t3clean.builder import (
     apply_concurrency_env,
     build_target,
     compute_adaptive_concurrency,
+    detect_host_glibc_version,
     ensure_isolated_toolchain,
     format_low_memory_warning,
     read_host_memory_info,
@@ -770,11 +771,19 @@ class BuilderTests(unittest.TestCase):
             clean_base_env = {
                 k: v
                 for k, v in os.environ.items()
-                if k not in ("RAYON_NUM_THREADS", "CARGO_BUILD_JOBS", "npm_config_child_concurrency", "T3CLEAN_JOBS")
+                if k
+                not in (
+                    "RAYON_NUM_THREADS",
+                    "CARGO_BUILD_JOBS",
+                    "npm_config_child_concurrency",
+                    "T3CLEAN_JOBS",
+                    "T3CODE_GLIBC_BUILD_CEILING",
+                )
             }
             with (
                 mock.patch.dict(os.environ, clean_base_env, clear=True),
                 mock.patch("t3clean.builder.read_host_memory_info", return_value=tight_mem),
+                mock.patch("t3clean.builder.detect_host_glibc_version", return_value="2.44"),
                 mock.patch("t3clean.builder.os.cpu_count", return_value=12),
                 mock.patch("t3clean.builder._run_cmd", side_effect=fake_run),
                 mock.patch("sys.stderr", stderr_buf),
@@ -794,11 +803,50 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(captured_envs[0]["RAYON_NUM_THREADS"], "4")
             self.assertEqual(captured_envs[0]["CARGO_BUILD_JOBS"], "4")
             self.assertEqual(captured_envs[0]["npm_config_child_concurrency"], "2")
+            self.assertEqual(captured_envs[0]["T3CODE_GLIBC_BUILD_CEILING"], "2.44")
             self.assertIn(str(src.resolve().parent), captured_envs[0]["GIT_CEILING_DIRECTORIES"].split(os.pathsep))
             stderr_text = stderr_buf.getvalue()
             self.assertIn("Auto-throttled build concurrency", stderr_text)
             self.assertIn("WARNING: Low available memory", stderr_text)
             self.assertIn("zram-only swap detected", stderr_text)
+
+    def test_detect_host_glibc_version_and_user_override(self) -> None:
+        with mock.patch("t3clean.builder.os.confstr", return_value="glibc 2.44"):
+            self.assertEqual(detect_host_glibc_version(), "2.44")
+        with mock.patch("t3clean.builder.os.confstr", return_value="glibc 2.39"):
+            self.assertEqual(detect_host_glibc_version(), "2.39")
+        with mock.patch("t3clean.builder.os.confstr", side_effect=OSError("unsupported")):
+            self.assertIsNone(detect_host_glibc_version())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            out = root / "out"
+            src.mkdir()
+            seen_ceiling: list[str] = []
+
+            def fake_run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> None:
+                seen_ceiling.append(env.get("T3CODE_GLIBC_BUILD_CEILING", ""))
+                unpacked = out / "linux-unpacked"
+                (unpacked / "resources").mkdir(parents=True, exist_ok=True)
+                (unpacked / "t3code").write_bytes(b"bin")
+
+            with (
+                mock.patch.dict(os.environ, {"T3CODE_GLIBC_BUILD_CEILING": "2.39"}),
+                mock.patch("t3clean.builder.detect_host_glibc_version", return_value="2.44"),
+                mock.patch("t3clean.builder._run_cmd", side_effect=fake_run),
+            ):
+                build_target(
+                    BuildOptions(
+                        source_dir=src,
+                        target="desktop-dir",
+                        version="0.1.12+notelemetry",
+                        output_dir=out,
+                        skip_install=True,
+                        skip_verify=True,
+                    )
+                )
+            self.assertEqual(seen_ceiling, ["2.39"])
 
 
 if __name__ == "__main__":

@@ -378,6 +378,14 @@ SAMPLE_WEB_INDEX_CSS = """\
 @custom-variant dark (&:is(.dark, .dark *));
 """
 
+SAMPLE_LINUX_GLIBC_TS = """\
+import * as NodeChildProcess from "node:child_process";
+
+// Both Linux release jobs build on Ubuntu 24.04; this is a build ceiling, not a distro support promise.
+const GLIBC_BUILD_CEILING = "2.39";
+export const keepGlibcHelper = NodeChildProcess.execFile;
+"""
+
 
 def _write_mock_tree(root: Path, *, legacy_v0111: bool = False) -> None:
     files = {
@@ -397,6 +405,8 @@ def _write_mock_tree(root: Path, *, legacy_v0111: bool = False) -> None:
         "apps/server/src/provider/ModelManifest.ts": SAMPLE_MODEL_MANIFEST_TS,
         "apps/server/src/usage/UsageService.ts": SAMPLE_USAGE_SERVICE_TS,
     }
+    if not legacy_v0111:
+        files["scripts/linux-glibc.ts"] = SAMPLE_LINUX_GLIBC_TS
     for rel, content in files.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -488,7 +498,7 @@ class TestPatchSourceTree(unittest.TestCase):
             self.assertFalse(pre_report.ok)
 
             results = patch_source_tree(root)
-            self.assertEqual(len(results), 9)
+            self.assertEqual(len(results), 10)
             self.assertTrue(all(isinstance(r, FilePatchResult) for r in results))
             self.assertTrue(all(r.changed and not r.already_patched for r in results))
 
@@ -550,6 +560,16 @@ class TestPatchSourceTree(unittest.TestCase):
             self.assertIn('@import "tailwindcss";\n@source not "../node_modules";', web_css)
             self.assertIn("@custom-variant dark", web_css)
 
+            # Linux glibc build ceiling made env-configurable
+            linux_glibc = (root / "scripts/linux-glibc.ts").read_text(encoding="utf-8")
+            self.assertTrue(linux_glibc.startswith(PATCH_MARKER))
+            self.assertIn(
+                'const GLIBC_BUILD_CEILING = process.env.T3CODE_GLIBC_BUILD_CEILING?.trim() || "99.0";',
+                linux_glibc,
+            )
+            self.assertNotIn('const GLIBC_BUILD_CEILING = "2.39";', linux_glibc)
+            self.assertIn("export const keepGlibcHelper", linux_glibc)
+
             # Desktop update policy disabled
             updater = (root / "apps/desktop/src/updates/DesktopUpdatePolicy.ts").read_text(
                 encoding="utf-8"
@@ -592,7 +612,7 @@ class TestPatchSourceTree(unittest.TestCase):
 
             # Second patch run must be strictly idempotent.
             second_results = patch_source_tree(root)
-            self.assertEqual(len(second_results), 9)
+            self.assertEqual(len(second_results), 10)
             self.assertTrue(all((not r.changed) and r.already_patched for r in second_results))
 
     def test_patch_v0111_tree_preserves_legacy_exports(self) -> None:
@@ -633,7 +653,7 @@ class TestPatchSourceTree(unittest.TestCase):
                 root,
                 PatchOptions(keep_updater=True, keep_cloud=True),
             )
-            self.assertEqual(len(results), 6)
+            self.assertEqual(len(results), 7)
             self.assertEqual(
                 (root / "apps/desktop/src/updates/DesktopUpdatePolicy.ts").read_text(encoding="utf-8"),
                 SAMPLE_DESKTOP_UPDATE_POLICY_TS,
@@ -653,7 +673,7 @@ class TestPatchSourceTree(unittest.TestCase):
             _write_mock_tree(root, legacy_v0111=False)
 
             results = patch_source_tree(root, PatchOptions(dry_run=True))
-            self.assertEqual(len(results), 9)
+            self.assertEqual(len(results), 10)
             self.assertTrue(all(r.changed and not r.already_patched for r in results))
             self.assertTrue(all(r.summary.startswith("dry-run:") for r in results))
             self.assertEqual(

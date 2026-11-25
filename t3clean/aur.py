@@ -478,6 +478,13 @@ _t3clean_scrub_env() {{
   export T3CODE_TELEMETRY_CHANNEL=dev
   export T3CODE_WEB_SOURCEMAP=false
   export VP_NODE_MANAGER=no
+  if [[ -z "${{T3CODE_GLIBC_BUILD_CEILING:-}}" ]]; then
+    local _host_glibc
+    _host_glibc="$(python3 -c 'import os, re; m = re.search(r"glibc\\s+(\\d+(?:\\.\\d+)+)", os.confstr("CS_GNU_LIBC_VERSION") or "", re.I); print(m.group(1) if m else "")' 2>/dev/null || true)"
+    if [[ -n "${{_host_glibc}}" ]]; then
+      export T3CODE_GLIBC_BUILD_CEILING="${{_host_glibc}}"
+    fi
+  fi
 
   local _cache_dir
   _cache_dir="$(_t3clean_cache_dir)"

@@ -99,6 +99,18 @@ class BuildOptions:
     skip_patch: bool = True
 
 
+def detect_host_glibc_version() -> str | None:
+    """Return host glibc ``X.Y`` version via ``os.confstr('CS_GNU_LIBC_VERSION')`` or ``None``."""
+    try:
+        raw = os.confstr("CS_GNU_LIBC_VERSION")
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    match = re.search(r"glibc\s+(\d+(?:\.\d+)+)", raw, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def read_host_memory_info(
     *,
     meminfo_path: Path = Path("/proc/meminfo"),
@@ -930,6 +942,10 @@ def build_target(options: BuildOptions) -> Path:
         env["GIT_CEILING_DIRECTORIES"] = (
             f"{existing_ceiling}{os.pathsep}{ceiling_dir}" if existing_ceiling else ceiling_dir
         )
+    if not env.get("T3CODE_GLIBC_BUILD_CEILING", "").strip():
+        host_glibc = detect_host_glibc_version()
+        if host_glibc:
+            env["T3CODE_GLIBC_BUILD_CEILING"] = host_glibc
     explicit_jobs = _resolve_explicit_jobs(options.jobs, env)
     mem_info = read_host_memory_info()
     applied_limits = apply_concurrency_env(env, mem_info, explicit_jobs=explicit_jobs)

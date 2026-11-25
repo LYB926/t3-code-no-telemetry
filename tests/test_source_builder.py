@@ -359,6 +359,83 @@ class BuilderTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "SHA-256 verification failed"):
                     ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64")
 
+    def test_ensure_isolated_toolchain_reuses_host_node_and_installs_isolated_vp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_root = Path(tmp) / "cache"
+            npm_calls: list[list[str]] = []
+
+            def fake_which(name: str, **_kwargs: object) -> str | None:
+                return {
+                    "node": "/usr/bin/node",
+                    "npm": "/usr/bin/npm",
+                    "vp": "/usr/bin/vp",
+                }.get(name)
+
+            def fake_subprocess_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if cmd == ["/usr/bin/node", "-v"]:
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="v26.13.1\n", stderr="")
+                if cmd == ["/usr/bin/vp", "--version"]:
+                    return subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=0,
+                        stdout="VITE+\nvp v1.3.0\n",
+                        stderr="",
+                    )
+                if cmd[0] == "/usr/bin/npm":
+                    npm_calls.append(cmd)
+                    prefix = Path(cmd[cmd.index("--prefix") + 1])
+                    vp = prefix / "bin" / "vp"
+                    vp.parent.mkdir(parents=True, exist_ok=True)
+                    vp.write_text("#!/bin/sh\necho 'vp v1.8.0'\n", encoding="utf-8")
+                    vp.chmod(0o755)
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+                if cmd[0].endswith("/vp-isolated/bin/vp") and cmd[1] == "--version":
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="vp v1.8.0\n", stderr="")
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with (
+                mock.patch("t3clean.builder.shutil.which", side_effect=fake_which),
+                mock.patch("t3clean.builder._download_bytes", side_effect=AssertionError("must not download Node")),
+                mock.patch("t3clean.builder._download_to_file", side_effect=AssertionError("must not download Node")),
+                mock.patch("t3clean.builder.subprocess.run", side_effect=fake_subprocess_run),
+            ):
+                bin_dir = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64")
+                self.assertEqual(bin_dir, (cache_root / "toolchains" / "vp-isolated" / "bin").resolve())
+                self.assertTrue((bin_dir / "vp").is_file())
+                self.assertEqual(len(npm_calls), 1)
+
+                # Second call reuses cached vp >= 1.4.0 without running npm again.
+                bin_dir2 = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64")
+                self.assertEqual(bin_dir2, bin_dir)
+                self.assertEqual(len(npm_calls), 1)
+
+    def test_ensure_isolated_toolchain_reuses_host_node_and_modern_vp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_root = Path(tmp) / "cache"
+            host_bin = Path(tmp) / "host-bin"
+            host_bin.mkdir()
+            fake_vp = host_bin / "vp"
+            fake_vp.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            def fake_which(name: str, **_kwargs: object) -> str | None:
+                return {"node": "/usr/bin/node", "npm": "/usr/bin/npm", "vp": str(fake_vp)}.get(name)
+
+            def fake_subprocess_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if cmd == ["/usr/bin/node", "-v"]:
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="v26.14.0\n", stderr="")
+                if cmd == [str(fake_vp), "--version"]:
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="vp v1.8.0\n", stderr="")
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with (
+                mock.patch("t3clean.builder.shutil.which", side_effect=fake_which),
+                mock.patch("t3clean.builder._download_bytes", side_effect=AssertionError("must not download Node")),
+                mock.patch("t3clean.builder.subprocess.run", side_effect=fake_subprocess_run),
+            ):
+                bin_dir = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64")
+
+            self.assertEqual(bin_dir, host_bin.resolve())
+
     def test_build_target_desktop_dir_and_system_electron_and_env_cleanup(self) -> None:
         self.assertEqual(
             VALID_TARGETS,

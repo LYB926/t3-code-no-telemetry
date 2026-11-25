@@ -68,7 +68,6 @@ ARCH_MAKEDEPENDS: tuple[str, ...] = (
     "rust",
     "pkgconf",
     "imagemagick",
-    "vite-plus>=1.4.0",
 )
 
 ARCH_OPTDEPENDS: tuple[str, ...] = (
@@ -299,13 +298,17 @@ def _build_standalone_script(repo_root: Path) -> str:
     return combined
 
 
-def _git_fragment_for_ref(ref: str) -> str:
+def _github_archive_source(ref: str) -> tuple[str, str]:
+    """Return ``(archive_filename, archive_url)`` for a GitHub tag, commit, or branch."""
     cleaned = ref.strip()
+    repo_base = DEFAULT_REPO_URL[:-4] if DEFAULT_REPO_URL.endswith(".git") else DEFAULT_REPO_URL
+    safe_ref = cleaned.replace("/", "-")
+    archive_name = f"t3code-{safe_ref}.tar.gz"
     if re.match(r"^v[0-9]", cleaned):
-        return f"#tag={cleaned}"
+        return archive_name, f"{repo_base}/archive/refs/tags/{cleaned}.tar.gz"
     if re.fullmatch(r"[0-9a-fA-F]{7,40}", cleaned):
-        return f"#commit={cleaned}"
-    return f"#branch={cleaned}"
+        return archive_name, f"{repo_base}/archive/{cleaned}.tar.gz"
+    return archive_name, f"{repo_base}/archive/refs/heads/{cleaned}.tar.gz"
 
 
 def _pkgver_for_ref(ref: str) -> str:
@@ -333,7 +336,9 @@ def _render_flat_pkgbuild(
     sha_launcher: str,
     sha_desktop: str,
 ) -> str:
-    git_fragment = _git_fragment_for_ref(upstream_ref)
+    archive_name, archive_url = _github_archive_source(upstream_ref)
+    ref_no_v = upstream_ref[1:] if re.match(r"^v[0-9]", upstream_ref) else upstream_ref
+    ref_safe = upstream_ref.replace("/", "-")
     depends_block = _format_bash_array("depends", ARCH_DEPENDS)
     makedepends_block = _format_bash_array("makedepends", ARCH_MAKEDEPENDS)
     optdepends_block = _format_bash_array("optdepends", ARCH_OPTDEPENDS)
@@ -366,12 +371,15 @@ if [[ "${{_use_system_electron}}" == "1" ]]; then
   depends+=("${{_system_electron_bin}}")
 fi
 
+# All makedepends are in official Arch/CachyOS repos; vp >= 1.4.0 is reused from
+# PATH or installed into the build cache via host npm (avoids rustup conflicts).
 {makedepends_block}
 {optdepends_block}
 
 # Coexists cleanly with t3code-bin (no conflicts/provides overlap).
+# Uses lightweight GitHub source archive instead of full git --mirror (~3.5 GiB).
 source=(
-  "t3code::git+{DEFAULT_REPO_URL}{git_fragment}"
+  "{archive_name}::{archive_url}"
   "t3clean-standalone.py"
   "t3-code-no-telemetry.sh"
   "t3-code-no-telemetry.desktop"
@@ -382,6 +390,26 @@ sha256sums=(
   '{sha_launcher}'
   '{sha_desktop}'
 )
+
+_t3clean_source_dir() {{
+  local _cand
+  for _cand in \\
+    "${{srcdir}}/t3code-{ref_no_v}" \\
+    "${{srcdir}}/t3code-{ref_safe}" \\
+    "${{srcdir}}/t3code"; do
+    if [[ -d "${{_cand}}" ]]; then
+      printf '%s' "${{_cand}}"
+      return 0
+    fi
+  done
+  _cand="$(find "${{srcdir}}" -maxdepth 1 -mindepth 1 -type d -name 't3code-*' -print -quit)"
+  if [[ -n "${{_cand}}" && -f "${{_cand}}/package.json" ]]; then
+    printf '%s' "${{_cand}}"
+    return 0
+  fi
+  echo "ERROR: Extracted T3 Code source directory not found under ${{srcdir}}" >&2
+  return 1
+}}
 
 _t3clean_arch() {{
   case "${{CARCH}}" in
@@ -407,6 +435,32 @@ _t3clean_cache_dir() {{
   fi
 }}
 
+_t3clean_vp_ok() {{
+  local _vp_bin="$1"
+  [[ -x "${{_vp_bin}}" ]] || return 1
+  local _ver
+  _ver="$(VP_NODE_MANAGER=no VP_ENV_FORBIDDEN=1 "${{_vp_bin}}" --version </dev/null 2>/dev/null | grep -oE 'vp v?[0-9]+\\.[0-9]+\\.[0-9]+' | head -n1 | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+')"
+  [[ -n "${{_ver}}" ]] || return 1
+  python3 -c 'import sys; v=tuple(int(x) for x in sys.argv[1].split(".")); sys.exit(0 if v >= (1, 4, 0) else 1)' "${{_ver}}"
+}}
+
+_t3clean_ensure_vp() {{
+  local _sys_vp
+  _sys_vp="$(command -v vp 2>/dev/null || true)"
+  if [[ -n "${{_sys_vp}}" ]] && _t3clean_vp_ok "${{_sys_vp}}"; then
+    return 0
+  fi
+  local _cache_dir _vp_prefix _vp_bin
+  _cache_dir="$(_t3clean_cache_dir)"
+  _vp_prefix="${{_cache_dir}}/toolchains/vp-isolated"
+  _vp_bin="${{_vp_prefix}}/bin/vp"
+  if ! _t3clean_vp_ok "${{_vp_bin}}"; then
+    mkdir -p "${{_vp_prefix}}"
+    VP_NODE_MANAGER=no npm install --global --prefix "${{_vp_prefix}}" vite-plus </dev/null
+  fi
+  export PATH="${{_vp_prefix}}/bin:${{PATH}}"
+}}
+
 _t3clean_scrub_env() {{
   local _var
   while IFS='=' read -r _var _; do
@@ -422,6 +476,7 @@ _t3clean_scrub_env() {{
   export DO_NOT_TRACK=1
   export T3CODE_TELEMETRY_CHANNEL=dev
   export T3CODE_WEB_SOURCEMAP=false
+  export VP_NODE_MANAGER=no
 
   local _cache_dir
   _cache_dir="$(_t3clean_cache_dir)"
@@ -434,32 +489,10 @@ _t3clean_scrub_env() {{
   export XDG_CACHE_HOME="${{_cache_dir}}/xdg"
 }}
 
-pkgver() {{
-  cd "${{srcdir}}/t3code"
-  local desc rest count hash tag
-
-  desc=$(git describe --long --tags --abbrev=7 --match='v[0-9]*' --exclude='*nightly*' --exclude='*preview*' 2>/dev/null) || {{
-    printf '0.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
-    return
-  }}
-
-  hash=${{desc##*-g}}
-  rest=${{desc%-g*}}
-  count=${{rest##*-}}
-  tag=${{rest%-${{count}}}}
-  tag=${{tag%-}}
-  tag=${{tag#v}}
-  tag=${{tag//-/.}}
-
-  if [[ "${{count}}" == "0" ]]; then
-    printf '%s' "${{tag}}"
-  else
-    printf '%s.r%s.g%s' "${{tag}}" "${{count}}" "${{hash}}"
-  fi
-}}
-
 prepare() {{
-  local _patch_args=(--source "${{srcdir}}/t3code")
+  local _src_dir
+  _src_dir="$(_t3clean_source_dir)"
+  local _patch_args=(--source "${{_src_dir}}")
   if [[ "${{_keep_updater}}" == "1" ]]; then
     _patch_args+=(--keep-updater)
   fi
@@ -470,9 +503,12 @@ prepare() {{
 }}
 
 build() {{
-  cd "${{srcdir}}/t3code"
+  local _src_dir
+  _src_dir="$(_t3clean_source_dir)"
+  cd "${{_src_dir}}"
   rm -f .env .env.local
   _t3clean_scrub_env
+  _t3clean_ensure_vp
 
   local _arch _build_ver
   _arch="$(_t3clean_arch)"
@@ -534,7 +570,8 @@ check() {{
 }}
 
 package() {{
-  local _payload_dir
+  local _payload_dir _src_dir
+  _src_dir="$(_t3clean_source_dir)"
   if [[ "${{_use_system_electron}}" == "1" ]]; then
     _payload_dir="${{srcdir}}/out/linux-system-electron"
   else
@@ -556,7 +593,7 @@ package() {{
   install -Dm644 "${{srcdir}}/t3-code-no-telemetry.desktop" \\
     "${{pkgdir}}/usr/share/applications/${{pkgname}}.desktop"
 
-  local _icon_src="${{srcdir}}/t3code/assets/prod/black-universal-1024.png"
+  local _icon_src="${{_src_dir}}/assets/prod/black-universal-1024.png"
   if [[ -f "${{_icon_src}}" ]]; then
     local _resize_tool=""
     if command -v magick >/dev/null 2>&1; then
@@ -583,7 +620,7 @@ package() {{
     fi
   fi
 
-  install -Dm644 "${{srcdir}}/t3code/LICENSE" "${{pkgdir}}/usr/share/licenses/${{pkgname}}/LICENSE"
+  install -Dm644 "${{_src_dir}}/LICENSE" "${{pkgdir}}/usr/share/licenses/${{pkgname}}/LICENSE"
 }}
 """
 
@@ -597,7 +634,7 @@ def _render_srcinfo(
     sha_launcher: str,
     sha_desktop: str,
 ) -> str:
-    git_fragment = _git_fragment_for_ref(upstream_ref)
+    archive_name, archive_url = _github_archive_source(upstream_ref)
     lines: list[str] = [
         f"pkgbase = {PKGNAME}",
         f"\tpkgdesc = {PKGDESC}",
@@ -618,7 +655,7 @@ def _render_srcinfo(
         lines.append(f"\toptions = {opt}")
     lines.extend(
         [
-            f"\tsource = t3code::git+{DEFAULT_REPO_URL}{git_fragment}",
+            f"\tsource = {archive_name}::{archive_url}",
             "\tsource = t3clean-standalone.py",
             "\tsource = t3-code-no-telemetry.sh",
             "\tsource = t3-code-no-telemetry.desktop",

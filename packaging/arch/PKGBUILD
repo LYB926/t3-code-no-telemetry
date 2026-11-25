@@ -61,6 +61,10 @@ if [[ "${_use_system_electron}" == "1" ]]; then
   depends+=("${_system_electron_bin}")
 fi
 
+# All makedepends are in official Arch/CachyOS repos (zero AUR build deps).
+# Vite+ (`vp >= 1.4.0`) is reused from PATH when present, or bootstrapped into
+# `${_cache_dir}/toolchains/vp-isolated` via host `npm` (avoids outdated AUR
+# `vite-plus-bin` and `rustup`/`rust` package conflicts).
 makedepends=(
   'git'
   'python'
@@ -71,23 +75,25 @@ makedepends=(
   'rust'
   'pkgconf'
   'imagemagick'
-  'vite-plus>=1.4.0'
 )
 
 optdepends=(
   'openai-codex: use the system-installed Codex CLI'
 )
 
+# Download lightweight GitHub source archive (~tens of MB) instead of makepkg's
+# full `git clone --mirror` (~3.5 GiB across 2.6M objects).
+_ref_safe="${_upstream_ref//\//-}"
 if [[ "${_upstream_ref}" =~ ^v[0-9] ]]; then
-  _git_fragment="#tag=${_upstream_ref}"
+  _source_url="https://github.com/pingdotgg/t3code/archive/refs/tags/${_upstream_ref}.tar.gz"
 elif [[ "${_upstream_ref}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-  _git_fragment="#commit=${_upstream_ref}"
+  _source_url="https://github.com/pingdotgg/t3code/archive/${_upstream_ref}.tar.gz"
 else
-  _git_fragment="#branch=${_upstream_ref}"
+  _source_url="https://github.com/pingdotgg/t3code/archive/refs/heads/${_upstream_ref}.tar.gz"
 fi
 
 source=(
-  "t3code::git+https://github.com/pingdotgg/t3code.git${_git_fragment}"
+  "t3code-${_ref_safe}.tar.gz::${_source_url}"
   "t3-code-no-telemetry.sh"
   "t3-code-no-telemetry.desktop"
 )
@@ -99,6 +105,27 @@ _t3clean_repo_root() {
   else
     cd "${startdir}/../.." && pwd
   fi
+}
+
+_t3clean_source_dir() {
+  local _ref_no_v="${_upstream_ref#v}"
+  local _cand
+  for _cand in \
+    "${srcdir}/t3code-${_ref_no_v}" \
+    "${srcdir}/t3code-${_ref_safe}" \
+    "${srcdir}/t3code"; do
+    if [[ -d "${_cand}" ]]; then
+      printf '%s' "${_cand}"
+      return 0
+    fi
+  done
+  _cand="$(find "${srcdir}" -maxdepth 1 -mindepth 1 -type d -name 't3code-*' -print -quit)"
+  if [[ -n "${_cand}" && -f "${_cand}/package.json" ]]; then
+    printf '%s' "${_cand}"
+    return 0
+  fi
+  echo "ERROR: Extracted T3 Code source directory not found under ${srcdir}" >&2
+  return 1
 }
 
 _t3clean_arch() {
@@ -119,8 +146,8 @@ _t3clean_semver() {
 
 # AUR-compliant caching: defaults to $srcdir/.cache (clean-chroot safe).
 # Set T3CLEAN_CACHE_DIR (e.g. ~/.cache/t3-code-no-telemetry) to persist
-# ELECTRON_CACHE, ELECTRON_BUILDER_CACHE, CARGO_HOME, PNPM_HOME, npm_config_store_dir
-# across rebuilds.
+# isolated vp, ELECTRON_CACHE, ELECTRON_BUILDER_CACHE, CARGO_HOME, PNPM_HOME,
+# and npm_config_store_dir across rebuilds.
 _t3clean_cache_dir() {
   if [[ -n "${T3CLEAN_CACHE_DIR:-}" ]]; then
     printf '%s' "${T3CLEAN_CACHE_DIR}"
@@ -130,33 +157,21 @@ _t3clean_cache_dir() {
 }
 
 pkgver() {
-  cd "${srcdir}/t3code"
-  local desc rest count hash tag
-
-  desc=$(git describe --long --tags --abbrev=7 --match='v[0-9]*' --exclude='*nightly*' --exclude='*preview*' 2>/dev/null) || {
-    printf '0.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  if [[ "${_upstream_ref}" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]//-/.}"
     return
-  }
-
-  hash=${desc##*-g}
-  rest=${desc%-g*}
-  count=${rest##*-}
-  tag=${rest%-${count}}
-  tag=${tag%-}
-  tag=${tag#v}
-  tag=${tag//-/.}
-
-  if [[ "${count}" == "0" ]]; then
-    printf '%s' "${tag}"
-  else
-    printf '%s.r%s.g%s' "${tag}" "${count}" "${hash}"
   fi
+  local _src_dir _base
+  _src_dir="$(_t3clean_source_dir)"
+  _base="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "${_src_dir}/apps/server/package.json" 2>/dev/null || printf '%s' "${pkgver}")"
+  printf '%s.%s' "${_base//-/.}" "${_upstream_ref//[^A-Za-z0-9._]/.}"
 }
 
 prepare() {
-  local _repo_root
+  local _repo_root _src_dir
   _repo_root="$(_t3clean_repo_root)"
-  local _patch_args=(--source "${srcdir}/t3code")
+  _src_dir="$(_t3clean_source_dir)"
+  local _patch_args=(--source "${_src_dir}")
   if [[ "${_keep_updater}" == "1" ]]; then
     _patch_args+=(--keep-updater)
   fi
@@ -167,8 +182,9 @@ prepare() {
 }
 
 build() {
-  local _repo_root _arch _build_ver _cache_dir
+  local _repo_root _src_dir _arch _build_ver _cache_dir
   _repo_root="$(_t3clean_repo_root)"
+  _src_dir="$(_t3clean_source_dir)"
   _arch="$(_t3clean_arch)"
   _build_ver="$(_t3clean_semver)"
   _cache_dir="$(_t3clean_cache_dir)"
@@ -179,12 +195,14 @@ build() {
   export CARGO_HOME="${_cache_dir}/cargo"
   export PNPM_HOME="${_cache_dir}/pnpm"
   export npm_config_store_dir="${_cache_dir}/pnpm-store"
+  export VP_NODE_MANAGER=no
 
   local _build_args=(
-    --source "${srcdir}/t3code"
+    --source "${_src_dir}"
     --skip-fetch
     --skip-patch
     --skip-verify
+    --bootstrap-toolchain
     --target desktop-dir
     --arch "${_arch}"
     --version "${_build_ver}"
@@ -206,11 +224,12 @@ build() {
   if [[ "${_build_deb}" == "1" ]]; then
     local _deb_out="${T3CLEAN_DEB_OUT_DIR:-${srcdir}/out-deb}"
     local _deb_args=(
-      --source "${srcdir}/t3code"
+      --source "${_src_dir}"
       --skip-fetch
       --skip-patch
       --skip-install
       --skip-verify
+      --bootstrap-toolchain
       --target desktop-deb
       --arch "${_arch}"
       --version "${_build_ver}"
@@ -251,7 +270,8 @@ check() {
 }
 
 package() {
-  local _payload_dir
+  local _payload_dir _src_dir
+  _src_dir="$(_t3clean_source_dir)"
   if [[ "${_use_system_electron}" == "1" ]]; then
     _payload_dir="${srcdir}/out/linux-system-electron"
   else
@@ -273,7 +293,7 @@ package() {
   install -Dm644 "${srcdir}/t3-code-no-telemetry.desktop" \
     "${pkgdir}/usr/share/applications/${pkgname}.desktop"
 
-  local _icon_src="${srcdir}/t3code/assets/prod/black-universal-1024.png"
+  local _icon_src="${_src_dir}/assets/prod/black-universal-1024.png"
   if [[ -f "${_icon_src}" ]]; then
     local _resize_tool=""
     if command -v magick >/dev/null 2>&1; then
@@ -300,5 +320,5 @@ package() {
     fi
   fi
 
-  install -Dm644 "${srcdir}/t3code/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${_src_dir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

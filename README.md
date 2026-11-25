@@ -76,24 +76,27 @@
 
 ## CachyOS / Arch Linux 本地 `makepkg` 构建
 
-仓库内置的 [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) 为薄包装脚本，直接调用根目录的 `t3clean.py`，不依赖 `fuse2`，且与官方 `t3code-bin` 完全共存。
+仓库内置的 [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) 为薄包装脚本，直接调用根目录的 `t3clean.py`：
+- **零 AUR 构建依赖**：所有 `makedepends` 均来自 Arch/CachyOS 官方源；构建时若系统未安装 `vp >= 1.4.0`，会自动使用宿主机 `npm` 将最新预编译版 `vite-plus` 隔离安装到缓存目录（避免 AUR `vite-plus-bin` 过旧或源码版 `vite-plus` 与系统 `rust` 的 `rustup` 冲突）。
+- **轻量源码压缩包**：直接下载 GitHub `archive/refs/tags/v0.1.12.tar.gz`（仅几十 MB），避开 `makepkg` `git+https://` 全量 `--mirror`（~3.5 GiB）。
+- 不依赖 `fuse2`，且与官方 `t3code-bin` 完全共存。
 
 ### 基础构建（默认干净沙箱缓存 `${srcdir}/.cache`）
 
 ```bash
 cd packaging/arch
 makepkg -s
-# 确认生成包无误后手动安装：
-# pacman -U t3-code-no-telemetry-*.pkg.tar.zst
+# 确认 check() 验净通过后手动安装（或直接用 makepkg -si 一键编译并安装）：
+# sudo pacman -U t3-code-no-telemetry-*.pkg.tar.zst
 ```
 
 ### 开启持久化构建缓存（推荐日常反复升级使用）
 
-默认遵循 AUR/clean-chroot 规范将缓存放在 `${srcdir}/.cache`。通过 `T3CLEAN_CACHE_DIR` 可跨次复用 `ELECTRON_CACHE`、`ELECTRON_BUILDER_CACHE`、`CARGO_HOME`、`PNPM_HOME` 与 `npm_config_store_dir`，大幅加速后续重编：
+默认遵循 AUR/clean-chroot 规范将缓存放在 `${srcdir}/.cache`。通过 `T3CLEAN_CACHE_DIR` 可跨次复用隔离 `vp`、`ELECTRON_CACHE`、`ELECTRON_BUILDER_CACHE`、`CARGO_HOME`、`PNPM_HOME` 与 `npm_config_store_dir`，大幅加速后续重编：
 
 ```bash
 cd packaging/arch
-T3CLEAN_CACHE_DIR="${HOME}/.cache/t3-code-no-telemetry" makepkg -s
+T3CLEAN_CACHE_DIR="${HOME}/.cache/t3-code-no-telemetry" makepkg -si
 ```
 
 ### 可选开关（默认全部关闭）

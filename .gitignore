@@ -14,5 +14,7 @@ packaging/arch/src/
 packaging/arch/pkg/
 packaging/arch/*.pkg.tar.*
 packaging/arch/t3code/
+packaging/arch/t3code-*.tar.gz
+packaging/arch/t3code-*/
 packaging/arch/out/
 packaging/arch/out-deb/

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -19,6 +20,9 @@ from . import DEFAULT_NODE_VERSION
 from .patcher import PatchOptions, patch_source_tree
 from .source import read_required_node_version, read_source_version
 from .verifier import VerifyOptions, verify_artifact
+
+MIN_VP_VERSION: tuple[int, int, int] = (1, 4, 0)
+_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 VALID_TARGETS: tuple[str, ...] = (
     "desktop-dir",
@@ -96,6 +100,7 @@ def sanitized_build_env(
     env["DO_NOT_TRACK"] = "1"
     env["T3CODE_TELEMETRY_CHANNEL"] = "dev"
     env["T3CODE_WEB_SOURCEMAP"] = "true" if sourcemap else "false"
+    env.setdefault("VP_NODE_MANAGER", "no")
 
     if cache_dir is not None:
         resolved_cache = Path(cache_dir).expanduser().resolve()
@@ -133,6 +138,16 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest().lower()
 
 
+def _parse_semver_tuple(raw: str | None) -> tuple[int, int, int] | None:
+    """Extract the first ``(major, minor, patch)`` tuple from ``raw``."""
+    if not raw:
+        return None
+    match = _SEMVER_RE.search(raw)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
 def _detect_node_version(node_bin: str) -> str | None:
     """Return the normalized ``X.Y.Z`` version of ``node_bin`` or ``None`` if unavailable."""
     try:
@@ -141,11 +156,65 @@ def _detect_node_version(node_bin: str) -> str | None:
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.CalledProcessError):
         return None
     version = result.stdout.strip().lstrip("v")
     return version or None
+
+
+def _detect_vp_version(vp_bin: str) -> tuple[int, int, int] | None:
+    """Return the ``(major, minor, patch)`` version of ``vp_bin`` without blocking on TTY prompts."""
+    probe_env = os.environ.copy()
+    probe_env["VP_NODE_MANAGER"] = "no"
+    probe_env["VP_ENV_FORBIDDEN"] = "1"
+    try:
+        result = subprocess.run(
+            [vp_bin, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=probe_env,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    output = result.stdout or result.stderr or ""
+    vp_line = re.search(r"\bvp\s+v?(\d+\.\d+\.\d+)\b", output)
+    if vp_line:
+        return _parse_semver_tuple(vp_line.group(1))
+    return _parse_semver_tuple(output)
+
+
+def _node_version_satisfies(found: str | None, required: str) -> bool:
+    """Return True if ``found`` matches ``required`` (same major and >= required minor/patch)."""
+    if not found:
+        return False
+    if found == required:
+        return True
+    found_tuple = _parse_semver_tuple(found)
+    req_tuple = _parse_semver_tuple(required)
+    if found_tuple is None or req_tuple is None:
+        return False
+    return found_tuple[0] == req_tuple[0] and found_tuple >= req_tuple
+
+
+def _install_vp_into_prefix(npm_exe: str, prefix_dir: Path, *, prepend_bin: Path | None = None) -> Path:
+    """Install ``vite-plus`` globally into ``prefix_dir`` and return ``prefix_dir / 'bin'``."""
+    prefix_dir.mkdir(parents=True, exist_ok=True)
+    npm_env = os.environ.copy()
+    if prepend_bin is not None:
+        npm_env["PATH"] = f"{prepend_bin}{os.pathsep}{npm_env.get('PATH', '')}"
+    npm_env["npm_config_prefix"] = str(prefix_dir)
+    npm_env["VP_NODE_MANAGER"] = "no"
+    subprocess.run(
+        [npm_exe, "install", "--global", "--prefix", str(prefix_dir), "vite-plus"],
+        check=True,
+        env=npm_env,
+        stdin=subprocess.DEVNULL,
+    )
+    return prefix_dir / "bin"
 
 
 def _safe_extract_tar_to(archive_path: Path, dest_dir: Path) -> None:
@@ -223,24 +292,46 @@ def ensure_isolated_toolchain(
     node_version: str = DEFAULT_NODE_VERSION,
     arch: str = "x64",
 ) -> Path:
-    """Ensure a matching ``node`` and ``vp`` toolchain is available without modifying system Node.
+    """Ensure a matching ``node`` and ``vp >= 1.4.0`` toolchain is available without modifying system Node.
 
-    If current ``PATH`` already provides ``node`` matching ``node_version`` and ``vp``, returns
-    its ``bin`` directory. Otherwise downloads official Node.js from ``nodejs.org``, verifies
-    its ``SHASUMS256.txt`` digest, extracts into ``cache_root/toolchains/node-v<ver>-linux-<arch>``,
-    installs ``vite-plus`` into that isolated prefix, and returns its ``bin/`` directory.
+    - If current ``PATH`` already provides a compatible ``node`` and ``vp >= 1.4.0``, returns
+      the directory containing ``vp`` (reusing host tools directly).
+    - If current ``PATH`` already provides a compatible ``node`` and ``npm``, but ``vp`` is
+      missing or older than ``1.4.0``, installs ``vite-plus`` into
+      ``cache_root/toolchains/vp-isolated`` using host ``npm`` (no Node download needed) and
+      returns its ``bin/`` directory.
+    - Otherwise downloads official Node.js from ``nodejs.org``, verifies its ``SHASUMS256.txt``
+      digest, extracts into ``cache_root/toolchains/node-v<ver>-linux-<arch>``, installs
+      ``vite-plus`` into that isolated prefix, and returns its ``bin/`` directory.
     """
     normalized_version = node_version.strip().lstrip("v")
     if arch not in VALID_ARCHES:
         raise ValueError(f"Unsupported architecture {arch!r}; expected one of {', '.join(VALID_ARCHES)}")
 
     current_node = shutil.which("node")
+    current_npm = shutil.which("npm")
     current_vp = shutil.which("vp")
-    if current_node is not None and current_vp is not None:
-        if _detect_node_version(current_node) == normalized_version:
-            return Path(current_node).resolve().parent
+    host_node_ok = current_node is not None and _node_version_satisfies(
+        _detect_node_version(current_node), normalized_version
+    )
+    host_vp_ver = _detect_vp_version(current_vp) if current_vp is not None else None
+    host_vp_ok = host_vp_ver is not None and host_vp_ver >= MIN_VP_VERSION
+
+    if host_node_ok and host_vp_ok:
+        assert current_vp is not None
+        return Path(current_vp).resolve().parent
 
     resolved_cache = Path(cache_root).expanduser().resolve()
+
+    if host_node_ok and current_npm is not None:
+        vp_prefix = resolved_cache / "toolchains" / "vp-isolated"
+        vp_bin_dir = vp_prefix / "bin"
+        cached_vp = vp_bin_dir / "vp"
+        cached_vp_ver = _detect_vp_version(str(cached_vp)) if cached_vp.is_file() else None
+        if cached_vp_ver is None or cached_vp_ver < MIN_VP_VERSION:
+            _install_vp_into_prefix(current_npm, vp_prefix)
+        return vp_bin_dir
+
     stem = f"node-v{normalized_version}-linux-{arch}"
     toolchain_dir = resolved_cache / "toolchains" / stem
     bin_dir = toolchain_dir / "bin"
@@ -281,14 +372,11 @@ def ensure_isolated_toolchain(
             shutil.move(str(extracted_root), str(toolchain_dir))
 
     if not vp_exe.is_file():
-        npm_env = os.environ.copy()
-        npm_env["PATH"] = f"{bin_dir}{os.pathsep}{npm_env.get('PATH', '')}"
-        npm_env["npm_config_prefix"] = str(toolchain_dir)
-        subprocess.run(
-            [str(npm_exe), "install", "--global", "--prefix", str(toolchain_dir), "vite-plus"],
-            check=True,
-            env=npm_env,
-        )
+        _install_vp_into_prefix(str(npm_exe), toolchain_dir, prepend_bin=bin_dir)
+    else:
+        existing_vp_ver = _detect_vp_version(str(vp_exe))
+        if existing_vp_ver is not None and existing_vp_ver < MIN_VP_VERSION:
+            _install_vp_into_prefix(str(npm_exe), toolchain_dir, prepend_bin=bin_dir)
 
     return bin_dir
 

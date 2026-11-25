@@ -371,6 +371,10 @@ class TestCliAndAur(unittest.TestCase):
         pkgbuild_text = ARCH_PKGBUILD.read_text(encoding="utf-8")
         self.assertIn("pkgname=t3-code-no-telemetry", pkgbuild_text)
         self.assertNotIn("fuse2", pkgbuild_text)
+        self.assertNotIn("vite-plus>=1.4.0", pkgbuild_text)
+        self.assertNotIn("git+https://", pkgbuild_text)
+        self.assertIn("archive/refs/tags/", pkgbuild_text)
+        self.assertIn("--bootstrap-toolchain", pkgbuild_text)
         self.assertNotIn("conflicts=('t3code-bin')", pkgbuild_text)
         self.assertNotIn('conflicts=("t3code-bin")', pkgbuild_text)
         self.assertIn('_build_deb="${T3CLEAN_BUILD_DEB:-0}"', pkgbuild_text)
@@ -446,7 +450,14 @@ class TestCliAndAur(unittest.TestCase):
             self.assertNotIn("../", srcinfo)
             self.assertNotIn("fuse2", pkgbuild)
             self.assertNotIn("fuse2", srcinfo)
-            self.assertIn("#tag=v0.1.12", pkgbuild)
+            self.assertNotIn("vite-plus>=1.4.0", pkgbuild)
+            self.assertNotIn("vite-plus>=1.4.0", srcinfo)
+            self.assertNotIn("git+https://", pkgbuild)
+            self.assertIn(
+                "t3code-v0.1.12.tar.gz::https://github.com/pingdotgg/t3code/archive/refs/tags/v0.1.12.tar.gz",
+                pkgbuild,
+            )
+            self.assertIn("_t3clean_ensure_vp", pkgbuild)
             self.assertIn("pkgrel=2", pkgbuild)
             self.assertIn('python3 "${srcdir}/t3clean-standalone.py"', pkgbuild)
 
@@ -477,7 +488,10 @@ class TestCliAndAur(unittest.TestCase):
             self.assertTrue(srcinfo.startswith("pkgbase = t3-code-no-telemetry\n"))
             self.assertIn("\tpkgver = 0.1.12\n", srcinfo)
             self.assertIn("\tpkgrel = 2\n", srcinfo)
-            self.assertIn("\tsource = t3code::git+https://github.com/pingdotgg/t3code.git#tag=v0.1.12\n", srcinfo)
+            self.assertIn(
+                "\tsource = t3code-v0.1.12.tar.gz::https://github.com/pingdotgg/t3code/archive/refs/tags/v0.1.12.tar.gz\n",
+                srcinfo,
+            )
             self.assertTrue(srcinfo.rstrip().endswith("pkgname = t3-code-no-telemetry"))
 
             # Run t3clean-standalone.py completely isolated from repo (no PYTHONPATH)
@@ -531,7 +545,7 @@ class TestCliAndAur(unittest.TestCase):
             )
             self.assertEqual(post_v.returncode, 0, post_v.stdout + post_v.stderr)
 
-    def test_export_aur_branch_ref(self) -> None:
+    def test_export_aur_branch_and_commit_refs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="t3clean-aur-branch-") as tmp:
             out_dir = Path(tmp) / "aur-main"
             proc = subprocess.run(
@@ -551,8 +565,31 @@ class TestCliAndAur(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             pkgbuild = (out_dir / "PKGBUILD").read_text(encoding="utf-8")
             srcinfo = (out_dir / ".SRCINFO").read_text(encoding="utf-8")
-            self.assertIn("#branch=main", pkgbuild)
-            self.assertIn("#branch=main", srcinfo)
+            expected_branch = "t3code-main.tar.gz::https://github.com/pingdotgg/t3code/archive/refs/heads/main.tar.gz"
+            self.assertIn(expected_branch, pkgbuild)
+            self.assertIn(expected_branch, srcinfo)
+
+            commit_dir = Path(tmp) / "aur-sha"
+            proc_sha = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI_SCRIPT),
+                    "export-aur",
+                    "--out",
+                    str(commit_dir),
+                    "--ref",
+                    "deadbeef1234",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc_sha.returncode, 0, proc_sha.stderr)
+            sha_pkgbuild = (commit_dir / "PKGBUILD").read_text(encoding="utf-8")
+            sha_srcinfo = (commit_dir / ".SRCINFO").read_text(encoding="utf-8")
+            expected_sha = "t3code-deadbeef1234.tar.gz::https://github.com/pingdotgg/t3code/archive/deadbeef1234.tar.gz"
+            self.assertIn(expected_sha, sha_pkgbuild)
+            self.assertIn(expected_sha, sha_srcinfo)
 
     def test_cli_build_propagates_fetched_version(self) -> None:
         spec = importlib.util.spec_from_file_location("t3clean_cli_under_test", CLI_SCRIPT)

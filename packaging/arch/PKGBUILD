@@ -63,9 +63,10 @@ if [[ "${_use_system_electron}" == "1" ]]; then
 fi
 
 # All makedepends are in official Arch/CachyOS repos (zero AUR build deps).
-# Vite+ (`vp >= 1.4.0`) is reused from PATH when present, or bootstrapped into
-# `${_cache_dir}/toolchains/vp-isolated` via host `npm` (avoids outdated AUR
-# `vite-plus-bin` and `rustup`/`rust` package conflicts).
+# Vite+ (`vp`) is reused from PATH when compatible, or bootstrapped into
+# `${_cache_dir}/toolchains/vp-isolated[-v<ver>]` via host `npm` pinned to
+# upstream's `pnpm-workspace.yaml` catalog version (fallback: `vite-plus@^1.4.0`,
+# avoiding outdated AUR `vite-plus-bin`, future 2.x breaks, and `rustup` conflicts).
 makedepends=(
   'git'
   'python'

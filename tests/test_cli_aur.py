@@ -251,6 +251,15 @@ class TestCliAndAur(unittest.TestCase):
         ):
             self.assertIn(flag, build_help)
 
+        aur_help = subprocess.run(
+            [sys.executable, str(CLI_SCRIPT), "export-aur", "--help"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for flag in ("--source-sha256", "--source-tarball", "--ref", "--pkgrel"):
+            self.assertIn(flag, aur_help)
+
     def test_cli_patch_and_verify_e2e(self) -> None:
         with tempfile.TemporaryDirectory(prefix="t3clean-cli-test-") as tmp:
             src_dir = Path(tmp) / "src"
@@ -438,6 +447,7 @@ class TestCliAndAur(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             payload = json.loads(proc.stdout)
             self.assertTrue(payload["ok"])
+            self.assertEqual(payload["source_sha256"], "SKIP")
 
             # 100% flat directory: zero subdirectories, exact 5 files
             entries = sorted(out_dir.iterdir(), key=lambda p: p.name)
@@ -468,7 +478,9 @@ class TestCliAndAur(unittest.TestCase):
                 "t3code-v0.1.12.tar.gz::https://github.com/pingdotgg/t3code/archive/refs/tags/v0.1.12.tar.gz",
                 pkgbuild,
             )
+            self.assertIn("_t3clean_required_vp_version", pkgbuild)
             self.assertIn("_t3clean_ensure_vp", pkgbuild)
+            self.assertIn("vite-plus@^1.4.0", pkgbuild)
             self.assertIn("_t3clean_apply_memory_guards", pkgbuild)
             self.assertIn("T3CLEAN_JOBS", pkgbuild)
             self.assertIn("GIT_CEILING_DIRECTORIES", pkgbuild)
@@ -605,6 +617,244 @@ class TestCliAndAur(unittest.TestCase):
             expected_sha = "t3code-deadbeef1234.tar.gz::https://github.com/pingdotgg/t3code/archive/deadbeef1234.tar.gz"
             self.assertIn(expected_sha, sha_pkgbuild)
             self.assertIn(expected_sha, sha_srcinfo)
+
+    def test_export_aur_source_sha256_explicit_tarball_auto_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="t3clean-aur-sha-") as tmp:
+            root = Path(tmp)
+
+            # 1. Explicit uppercase 64-hex digest is normalized to lowercase in PKGBUILD + .SRCINFO.
+            explicit_upper = "A1B2C3D4" * 8
+            explicit_lower = explicit_upper.lower()
+            out_explicit = root / "aur-explicit"
+            proc_explicit = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI_SCRIPT),
+                    "export-aur",
+                    "--out",
+                    str(out_explicit),
+                    "--ref",
+                    "v0.1.12",
+                    "--source-sha256",
+                    explicit_upper,
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc_explicit.returncode, 0, proc_explicit.stderr)
+            explicit_payload = json.loads(proc_explicit.stdout)
+            self.assertEqual(explicit_payload["source_sha256"], explicit_lower)
+            pkgbuild_text = (out_explicit / "PKGBUILD").read_text(encoding="utf-8")
+            srcinfo_text = (out_explicit / ".SRCINFO").read_text(encoding="utf-8")
+            self.assertIn(f"  '{explicit_lower}'\n", pkgbuild_text)
+            self.assertIn(f"\tsha256sums = {explicit_lower}\n", srcinfo_text)
+            self.assertNotIn("'SKIP'", pkgbuild_text)
+            self.assertNotIn("\tsha256sums = SKIP", srcinfo_text)
+
+            # 2. --source-tarball hashes a local archive file directly.
+            fake_tarball = root / "t3code-v0.1.12.tar.gz"
+            fake_tarball.write_bytes(b"synthetic-t3code-source-tarball-v0.1.12")
+            tarball_sha = _sha256(fake_tarball)
+            out_tarball = root / "aur-tarball"
+            proc_tarball = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI_SCRIPT),
+                    "export-aur",
+                    "--out",
+                    str(out_tarball),
+                    "--ref",
+                    "v0.1.12",
+                    "--source-tarball",
+                    str(fake_tarball),
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc_tarball.returncode, 0, proc_tarball.stderr)
+            tarball_payload = json.loads(proc_tarball.stdout)
+            self.assertEqual(tarball_payload["source_sha256"], tarball_sha)
+            self.assertIn(f"  '{tarball_sha}'\n", (out_tarball / "PKGBUILD").read_text(encoding="utf-8"))
+            self.assertIn(f"\tsha256sums = {tarball_sha}\n", (out_tarball / ".SRCINFO").read_text(encoding="utf-8"))
+
+            # 3. --source-sha256 auto streams the GitHub archive URL once.
+            import t3clean.aur as aur_mod
+
+            auto_sha = "f0e1d2c3" * 8
+            out_auto = root / "aur-auto"
+            spec = importlib.util.spec_from_file_location("t3clean_cli_aur_auto", CLI_SCRIPT)
+            assert spec is not None and spec.loader is not None
+            cli_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cli_mod)
+            with mock.patch.object(aur_mod, "_sha256_url", return_value=auto_sha) as sha_url_mock:
+                rc = cli_mod.main(
+                    [
+                        "export-aur",
+                        "--out",
+                        str(out_auto),
+                        "--ref",
+                        "v0.1.12",
+                        "--source-sha256",
+                        "auto",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            sha_url_mock.assert_called_once_with(
+                "https://github.com/pingdotgg/t3code/archive/refs/tags/v0.1.12.tar.gz"
+            )
+            self.assertIn(f"  '{auto_sha}'\n", (out_auto / "PKGBUILD").read_text(encoding="utf-8"))
+            self.assertIn(f"\tsha256sums = {auto_sha}\n", (out_auto / ".SRCINFO").read_text(encoding="utf-8"))
+
+            # 4. Invalid digest, mutual exclusion, and missing tarball all fail cleanly.
+            bad_hex = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI_SCRIPT),
+                    "export-aur",
+                    "--out",
+                    str(root / "aur-bad"),
+                    "--source-sha256",
+                    "not-a-valid-sha256",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(bad_hex.returncode, 1)
+            self.assertIn("Invalid source_sha256", json.loads(bad_hex.stdout)["error"])
+
+            both_flags = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI_SCRIPT),
+                    "export-aur",
+                    "--out",
+                    str(root / "aur-both"),
+                    "--source-sha256",
+                    explicit_lower,
+                    "--source-tarball",
+                    str(fake_tarball),
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(both_flags.returncode, 1)
+            self.assertIn("Cannot specify both", json.loads(both_flags.stdout)["error"])
+
+            missing_tar = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI_SCRIPT),
+                    "export-aur",
+                    "--out",
+                    str(root / "aur-missing"),
+                    "--source-tarball",
+                    str(root / "does-not-exist.tar.gz"),
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing_tar.returncode, 1)
+            self.assertIn("Source tarball not found", json.loads(missing_tar.stdout)["error"])
+
+    def test_export_aur_pkgbuild_vp_pinning_helpers_execute_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="t3clean-aur-vp-bash-") as tmp:
+            root = Path(tmp)
+            out_dir = root / "aur-out"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI_SCRIPT),
+                    "export-aur",
+                    "--out",
+                    str(out_dir),
+                    "--ref",
+                    "v0.1.12",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            pkgbuild_path = out_dir / "PKGBUILD"
+
+            # Synthetic source dirs: catalog-pinned, package.json fallback, and unpinned.
+            src_catalog = root / "src-catalog"
+            src_catalog.mkdir()
+            (src_catalog / "pnpm-workspace.yaml").write_text(
+                "catalog:\n  vite-plus: 1.8.0\noverrides:\n  vite-plus: 'catalog:'\n",
+                encoding="utf-8",
+            )
+            src_pkg = root / "src-pkg"
+            src_pkg.mkdir()
+            (src_pkg / "package.json").write_text(
+                json.dumps({"devDependencies": {"vite-plus": "^1.7.5"}}),
+                encoding="utf-8",
+            )
+            src_none = root / "src-none"
+            src_none.mkdir()
+
+            # Fake host PATH containing a breaking vp 2.0.0 and a recording fake npm.
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            npm_log = root / "npm.log"
+            (fake_bin / "vp").write_text("#!/bin/sh\necho 'vp v2.0.0'\n", encoding="utf-8")
+            (fake_bin / "vp").chmod(0o755)
+            (fake_bin / "npm").write_text(
+                f"#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{npm_log}"\n'
+                f'prefix=""\n'
+                f'spec=""\n'
+                f'while [ $# -gt 0 ]; do\n'
+                f'  if [ "$1" = "--prefix" ]; then shift; prefix="$1"; else spec="$1"; fi\n'
+                f'  shift\n'
+                f'done\n'
+                f'mkdir -p "$prefix/bin"\n'
+                f'ver="${{spec#*@}}"\n'
+                f'ver="${{ver#^}}"\n'
+                f'printf "#!/bin/sh\\necho \\"vp v%s\\"\\n" "$ver" > "$prefix/bin/vp"\n'
+                f'chmod +x "$prefix/bin/vp"\n',
+                encoding="utf-8",
+            )
+            (fake_bin / "npm").chmod(0o755)
+
+            cache_dir = root / "cache"
+            harness = (
+                "set -euo pipefail\n"
+                f'source "{pkgbuild_path}"\n'
+                f'export T3CLEAN_CACHE_DIR="{cache_dir}"\n'
+                f'export PATH="{fake_bin}:$PATH"\n'
+                f'test "$(_t3clean_required_vp_version "{src_catalog}")" = "1.8.0"\n'
+                f'test "$(_t3clean_required_vp_version "{src_pkg}")" = "1.7.5"\n'
+                f'test -z "$(_t3clean_required_vp_version "{src_none}")"\n'
+                f'! _t3clean_vp_ok "{fake_bin}/vp" "1.8.0"\n'
+                f'! _t3clean_vp_ok "{fake_bin}/vp" ""\n'
+                f'_t3clean_ensure_vp "{src_catalog}"\n'
+                f'test "$(command -v vp)" = "{cache_dir}/toolchains/vp-isolated-v1.8.0/bin/vp"\n'
+                f'export PATH="{fake_bin}:$PATH"\n'
+                f'_t3clean_ensure_vp "{src_none}"\n'
+                f'test "$(command -v vp)" = "{cache_dir}/toolchains/vp-isolated/bin/vp"\n'
+            )
+            bash_run = subprocess.run(
+                ["bash", "-c", harness],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(bash_run.returncode, 0, bash_run.stdout + bash_run.stderr)
+            logged = npm_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(logged), 2)
+            self.assertIn("vite-plus@1.8.0", logged[0])
+            self.assertIn("vite-plus@^1.4.0", logged[1])
 
     def test_cli_build_propagates_fetched_version(self) -> None:
         spec = importlib.util.spec_from_file_location("t3clean_cli_under_test", CLI_SCRIPT)

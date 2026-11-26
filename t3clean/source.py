@@ -18,6 +18,9 @@ _VERSION_REF_RE = re.compile(
     r"^v?(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$"
 )
 _NODE_VERSION_RE = re.compile(r"^(?:>=|<=|>|<|=|\^|~|\s)*v?(\d+\.\d+\.\d+)$")
+_VP_VERSION_RE = re.compile(r"^(?:>=|<=|>|<|=|\^|~|\s)*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
+_YAML_CATALOG_HEADER_RE = re.compile(r"^catalog\s*:\s*(?:#.*)?$")
+_YAML_VP_ENTRY_RE = re.compile(r"""^(?:"vite-plus"|'vite-plus'|vite-plus)\s*:\s*(.+?)\s*$""")
 _EXCLUDED_TAG_MARKERS = ("nightly", "preview")
 
 
@@ -203,6 +206,81 @@ def read_required_node_version(source_dir: Path) -> str:
     if match is None:
         return DEFAULT_NODE_VERSION
     return match.group(1)
+
+
+def _extract_yaml_scalar(raw_value: str) -> str:
+    """Extract a quoted or unquoted YAML scalar value, stripping trailing comments."""
+    val = raw_value.strip()
+    if not val:
+        return ""
+    if val.startswith('"'):
+        m = re.match(r'^"([^"]+)"(?:\s*#.*)?$', val)
+        return m.group(1).strip() if m else ""
+    if val.startswith("'"):
+        m = re.match(r"^'([^']+)'(?:\s*#.*)?$", val)
+        return m.group(1).strip() if m else ""
+    return val.split("#", 1)[0].strip()
+
+
+def read_required_vp_version(source_dir: Path) -> str | None:
+    """Read the pinned ``vite-plus`` version from ``pnpm-workspace.yaml`` or ``package.json``.
+
+    Checks the top-level ``catalog:`` mapping in ``pnpm-workspace.yaml`` first (matching
+    upstream T3 Code's pnpm catalog layout), then falls back to root ``package.json``
+    dependency fields (ignoring ``catalog:``/``workspace:`` specifiers). Returns a normalized
+    SemVer string such as ``"1.8.0"``, or ``None`` when no concrete version is declared.
+    """
+    source_path = Path(source_dir)
+    workspace_yaml = source_path / "pnpm-workspace.yaml"
+    if workspace_yaml.is_file():
+        try:
+            lines = workspace_yaml.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            lines = []
+        in_catalog = False
+        catalog_indent: int | None = None
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(raw_line) - len(raw_line.lstrip(" \t"))
+            if indent == 0:
+                in_catalog = bool(_YAML_CATALOG_HEADER_RE.match(stripped))
+                catalog_indent = None
+                continue
+            if not in_catalog:
+                continue
+            if catalog_indent is None:
+                catalog_indent = indent
+            if indent != catalog_indent:
+                continue
+            entry_match = _YAML_VP_ENTRY_RE.match(stripped)
+            if entry_match is None:
+                continue
+            scalar = _extract_yaml_scalar(entry_match.group(1))
+            ver_match = _VP_VERSION_RE.match(scalar)
+            if ver_match is not None:
+                return ver_match.group(1)
+
+    package_json = source_path / "package.json"
+    if package_json.is_file():
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict):
+            for section_name in ("devDependencies", "dependencies", "optionalDependencies"):
+                section = data.get(section_name)
+                if not isinstance(section, dict):
+                    continue
+                raw_spec = section.get("vite-plus")
+                if not isinstance(raw_spec, str):
+                    continue
+                ver_match = _VP_VERSION_RE.match(raw_spec.strip())
+                if ver_match is not None:
+                    return ver_match.group(1)
+
+    return None
 
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")

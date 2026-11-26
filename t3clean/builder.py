@@ -18,10 +18,12 @@ from typing import Mapping
 
 from . import DEFAULT_NODE_VERSION
 from .patcher import PatchOptions, patch_source_tree
-from .source import read_required_node_version, read_source_version
+from .source import read_required_node_version, read_required_vp_version, read_source_version
 from .verifier import VerifyOptions, verify_artifact
 
 MIN_VP_VERSION: tuple[int, int, int] = (1, 4, 0)
+DEFAULT_VP_FALLBACK_MAJOR: int = 1
+DEFAULT_VP_FALLBACK_SPEC: str = "vite-plus@^1.4.0"
 _SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 LOW_TOTAL_MEM_MIB: int = 16 * 1024 + 512
@@ -414,16 +416,51 @@ def _node_version_satisfies(found: str | None, required: str) -> bool:
     return found_tuple[0] == req_tuple[0] and found_tuple >= req_tuple
 
 
-def _install_vp_into_prefix(npm_exe: str, prefix_dir: Path, *, prepend_bin: Path | None = None) -> Path:
-    """Install ``vite-plus`` globally into ``prefix_dir`` and return ``prefix_dir / 'bin'``."""
+def _vp_version_satisfies(
+    found: tuple[int, int, int] | None,
+    required: str | None = None,
+) -> bool:
+    """Return True if detected ``vp`` version matches ``required``'s major line and minimum.
+
+    When ``required`` is provided (e.g. ``"1.8.0"`` from ``pnpm-workspace.yaml``), requires the
+    same major version and ``found >= required``. When ``required`` is ``None``, requires
+    ``1.x >= MIN_VP_VERSION`` (blocking breaking ``2.x`` upgrades).
+    """
+    if found is None:
+        return False
+    if required is not None:
+        req_tuple = _parse_semver_tuple(required)
+        if req_tuple is not None:
+            return found[0] == req_tuple[0] and found >= req_tuple
+    return found[0] == DEFAULT_VP_FALLBACK_MAJOR and found >= MIN_VP_VERSION
+
+
+def _vp_npm_package_spec(vp_version: str | None = None) -> str:
+    """Return the version-pinned npm package specifier for ``vite-plus``."""
+    if vp_version:
+        cleaned = vp_version.strip().lstrip("v")
+        if cleaned:
+            return f"vite-plus@{cleaned}"
+    return DEFAULT_VP_FALLBACK_SPEC
+
+
+def _install_vp_into_prefix(
+    npm_exe: str,
+    prefix_dir: Path,
+    *,
+    prepend_bin: Path | None = None,
+    vp_version: str | None = None,
+) -> Path:
+    """Install pinned ``vite-plus`` globally into ``prefix_dir`` and return ``prefix_dir / 'bin'``."""
     prefix_dir.mkdir(parents=True, exist_ok=True)
     npm_env = os.environ.copy()
     if prepend_bin is not None:
         npm_env["PATH"] = f"{prepend_bin}{os.pathsep}{npm_env.get('PATH', '')}"
     npm_env["npm_config_prefix"] = str(prefix_dir)
     npm_env["VP_NODE_MANAGER"] = "no"
+    package_spec = _vp_npm_package_spec(vp_version)
     subprocess.run(
-        [npm_exe, "install", "--global", "--prefix", str(prefix_dir), "vite-plus"],
+        [npm_exe, "install", "--global", "--prefix", str(prefix_dir), package_spec],
         check=True,
         env=npm_env,
         stdin=subprocess.DEVNULL,
@@ -505,20 +542,25 @@ def ensure_isolated_toolchain(
     cache_root: Path,
     node_version: str = DEFAULT_NODE_VERSION,
     arch: str = "x64",
+    vp_version: str | None = None,
 ) -> Path:
-    """Ensure a matching ``node`` and ``vp >= 1.4.0`` toolchain is available without modifying system Node.
+    """Ensure a matching ``node`` and version-pinned ``vp`` toolchain without modifying system Node.
 
-    - If current ``PATH`` already provides a compatible ``node`` and ``vp >= 1.4.0``, returns
-      the directory containing ``vp`` (reusing host tools directly).
+    - If current ``PATH`` already provides a compatible ``node`` and a compatible ``vp``
+      (matching ``vp_version``'s major line and minimum, or ``1.x >= 1.4.0`` when unpinned),
+      returns the directory containing ``vp`` (reusing host tools directly).
     - If current ``PATH`` already provides a compatible ``node`` and ``npm``, but ``vp`` is
-      missing or older than ``1.4.0``, installs ``vite-plus`` into
-      ``cache_root/toolchains/vp-isolated`` using host ``npm`` (no Node download needed) and
-      returns its ``bin/`` directory.
+      missing or incompatible, installs pinned ``vite-plus@<vp_version>`` (or ``vite-plus@^1.4.0``
+      fallback) into ``cache_root/toolchains/vp-isolated[-v<vp_version>]`` using host ``npm``
+      (reusing an already-compatible ``vp-isolated`` cache when present) and returns its ``bin/``.
     - Otherwise downloads official Node.js from ``nodejs.org``, verifies its ``SHASUMS256.txt``
-      digest, extracts into ``cache_root/toolchains/node-v<ver>-linux-<arch>``, installs
+      digest, extracts into ``cache_root/toolchains/node-v<ver>-linux-<arch>``, installs pinned
       ``vite-plus`` into that isolated prefix, and returns its ``bin/`` directory.
     """
     normalized_version = node_version.strip().lstrip("v")
+    normalized_vp = (
+        vp_version.strip().lstrip("v") if vp_version is not None and vp_version.strip() else None
+    )
     if arch not in VALID_ARCHES:
         raise ValueError(f"Unsupported architecture {arch!r}; expected one of {', '.join(VALID_ARCHES)}")
 
@@ -529,7 +571,7 @@ def ensure_isolated_toolchain(
         _detect_node_version(current_node), normalized_version
     )
     host_vp_ver = _detect_vp_version(current_vp) if current_vp is not None else None
-    host_vp_ok = host_vp_ver is not None and host_vp_ver >= MIN_VP_VERSION
+    host_vp_ok = _vp_version_satisfies(host_vp_ver, normalized_vp)
 
     if host_node_ok and host_vp_ok:
         assert current_vp is not None
@@ -538,12 +580,27 @@ def ensure_isolated_toolchain(
     resolved_cache = Path(cache_root).expanduser().resolve()
 
     if host_node_ok and current_npm is not None:
-        vp_prefix = resolved_cache / "toolchains" / "vp-isolated"
+        legacy_vp_prefix = resolved_cache / "toolchains" / "vp-isolated"
+        if normalized_vp is not None:
+            vp_prefix = resolved_cache / "toolchains" / f"vp-isolated-v{normalized_vp}"
+            vp_bin_dir = vp_prefix / "bin"
+            cached_vp = vp_bin_dir / "vp"
+            cached_vp_ver = _detect_vp_version(str(cached_vp)) if cached_vp.is_file() else None
+            if _vp_version_satisfies(cached_vp_ver, normalized_vp):
+                return vp_bin_dir
+            legacy_vp = legacy_vp_prefix / "bin" / "vp"
+            legacy_vp_ver = _detect_vp_version(str(legacy_vp)) if legacy_vp.is_file() else None
+            if _vp_version_satisfies(legacy_vp_ver, normalized_vp):
+                return legacy_vp_prefix / "bin"
+            _install_vp_into_prefix(current_npm, vp_prefix, vp_version=normalized_vp)
+            return vp_bin_dir
+
+        vp_prefix = legacy_vp_prefix
         vp_bin_dir = vp_prefix / "bin"
         cached_vp = vp_bin_dir / "vp"
         cached_vp_ver = _detect_vp_version(str(cached_vp)) if cached_vp.is_file() else None
-        if cached_vp_ver is None or cached_vp_ver < MIN_VP_VERSION:
-            _install_vp_into_prefix(current_npm, vp_prefix)
+        if not _vp_version_satisfies(cached_vp_ver, None):
+            _install_vp_into_prefix(current_npm, vp_prefix, vp_version=None)
         return vp_bin_dir
 
     stem = f"node-v{normalized_version}-linux-{arch}"
@@ -586,11 +643,21 @@ def ensure_isolated_toolchain(
             shutil.move(str(extracted_root), str(toolchain_dir))
 
     if not vp_exe.is_file():
-        _install_vp_into_prefix(str(npm_exe), toolchain_dir, prepend_bin=bin_dir)
+        _install_vp_into_prefix(
+            str(npm_exe),
+            toolchain_dir,
+            prepend_bin=bin_dir,
+            vp_version=normalized_vp,
+        )
     else:
         existing_vp_ver = _detect_vp_version(str(vp_exe))
-        if existing_vp_ver is not None and existing_vp_ver < MIN_VP_VERSION:
-            _install_vp_into_prefix(str(npm_exe), toolchain_dir, prepend_bin=bin_dir)
+        if not _vp_version_satisfies(existing_vp_ver, normalized_vp):
+            _install_vp_into_prefix(
+                str(npm_exe),
+                toolchain_dir,
+                prepend_bin=bin_dir,
+                vp_version=normalized_vp,
+            )
 
     return bin_dir
 
@@ -973,6 +1040,7 @@ def build_target(options: BuildOptions) -> Path:
     isolated_node_bin: Path | None = None
     if options.bootstrap_toolchain:
         required_node = read_required_node_version(source_dir)
+        required_vp = read_required_vp_version(source_dir)
         toolchain_cache = (
             Path(options.cache_dir).expanduser().resolve()
             if options.cache_dir is not None
@@ -982,6 +1050,7 @@ def build_target(options: BuildOptions) -> Path:
             toolchain_cache,
             required_node,
             arch=options.arch,
+            vp_version=required_vp,
         )
         env["PATH"] = f"{toolchain_bin}{os.pathsep}{env.get('PATH', '')}"
         candidate_node = toolchain_bin / "node"

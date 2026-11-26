@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from t3clean import DEFAULT_REF, DEFAULT_REPO_URL  # noqa: E402
-from t3clean.aur import export_aur_package  # noqa: E402
+from t3clean.aur import export_aur_package, resolve_source_sha256  # noqa: E402
 from t3clean.builder import BuildOptions, VALID_TARGETS, build_target  # noqa: E402
 from t3clean.deployer import (  # noqa: E402
     DeployOptions,
@@ -284,11 +284,18 @@ def _cmd_rollback_server(args: argparse.Namespace) -> int:
 def _cmd_export_aur(args: argparse.Namespace) -> int:
     as_json = _wants_json(args)
     out_dir = Path(args.out).expanduser().resolve()
+    source_tarball = Path(args.source_tarball).expanduser().resolve() if args.source_tarball else None
+    resolved_sha = resolve_source_sha256(
+        args.ref,
+        source_sha256=args.source_sha256,
+        source_tarball=source_tarball,
+    )
     created = export_aur_package(
         repo_root=REPO_ROOT,
         out_dir=out_dir,
         upstream_ref=args.ref,
         pkgrel=args.pkgrel,
+        source_sha256=resolved_sha,
     )
     if as_json:
         _emit_json(
@@ -297,13 +304,23 @@ def _cmd_export_aur(args: argparse.Namespace) -> int:
                 "out": str(out_dir),
                 "ref": args.ref,
                 "pkgrel": args.pkgrel,
+                "source_sha256": resolved_sha,
                 "files": [str(path) for path in created],
             }
         )
     else:
-        print(f"Exported flat AUR package (ref={args.ref}, pkgrel={args.pkgrel}) -> {out_dir}")
+        print(
+            f"Exported flat AUR package (ref={args.ref}, pkgrel={args.pkgrel}, "
+            f"source_sha256={resolved_sha}) -> {out_dir}"
+        )
         for path in created:
             print(f"  - {path.name}")
+        if resolved_sha == "SKIP":
+            print(
+                "NOTE: Source tarball checksum is SKIP. For public AUR uploads of a pinned tag, "
+                "pass --source-sha256 <64-hex|auto> or --source-tarball <path>.",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -612,6 +629,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Arch package release number (default: 1).",
+    )
+    p_aur.add_argument(
+        "--source-sha256",
+        default=None,
+        help=(
+            "SHA-256 hex digest for the upstream source tarball, 'auto' (stream-download "
+            "the archive URL and compute SHA-256), or 'SKIP' (default: SKIP)."
+        ),
+    )
+    p_aur.add_argument(
+        "--source-tarball",
+        default=None,
+        help=(
+            "Compute the upstream source tarball SHA-256 from an already-downloaded local "
+            ".tar.gz file (mutually exclusive with --source-sha256)."
+        ),
     )
     _add_json_flag(p_aur)
     p_aur.set_defaults(handler=_cmd_export_aur)

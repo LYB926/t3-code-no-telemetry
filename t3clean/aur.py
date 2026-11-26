@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import urllib.error
+import urllib.request
 
 from . import DEFAULT_REF, DEFAULT_REPO_URL
 
@@ -195,12 +197,199 @@ if __name__ == "__main__":
 '''
 
 
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+_AUR_VP_HELPERS = r'''_t3clean_required_vp_version() {
+  local _src_dir="${1:-.}"
+  python3 - "${_src_dir}" <<'PY' 2>/dev/null || true
+import json, pathlib, re, sys
+
+src = pathlib.Path(sys.argv[1])
+ver_re = re.compile(r"^(?:>=|<=|>|<|=|\^|~|\s)*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
+key_re = re.compile(r"""^(?:"vite-plus"|'vite-plus'|vite-plus)\s*:\s*(.+?)\s*$""")
+
+ws = src / "pnpm-workspace.yaml"
+if ws.is_file():
+    in_catalog = False
+    cat_indent = None
+    for raw in ws.read_text(encoding="utf-8", errors="ignore").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" \t"))
+        if indent == 0:
+            in_catalog = bool(re.match(r"^catalog\s*:\s*(?:#.*)?$", stripped))
+            cat_indent = None
+            continue
+        if not in_catalog:
+            continue
+        if cat_indent is None:
+            cat_indent = indent
+        if indent != cat_indent:
+            continue
+        m = key_re.match(stripped)
+        if not m:
+            continue
+        val = m.group(1)
+        if val.startswith('"'):
+            qm = re.match(r'^"([^"]+)"(?:\s*#.*)?$', val)
+            val = qm.group(1) if qm else ""
+        elif val.startswith("'"):
+            qm = re.match(r"^'([^']+)'(?:\s*#.*)?$", val)
+            val = qm.group(1) if qm else ""
+        else:
+            val = val.split("#", 1)[0].strip()
+        vm = ver_re.match(val.strip())
+        if vm:
+            print(vm.group(1))
+            sys.exit(0)
+
+pkg = src / "package.json"
+if pkg.is_file():
+    try:
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        for sec in ("devDependencies", "dependencies", "optionalDependencies"):
+            deps = data.get(sec)
+            if isinstance(deps, dict) and isinstance(deps.get("vite-plus"), str):
+                vm = ver_re.match(deps["vite-plus"].strip())
+                if vm:
+                    print(vm.group(1))
+                    sys.exit(0)
+PY
+}
+
+_t3clean_vp_ok() {
+  local _vp_bin="$1"
+  local _req_ver="${2:-}"
+  [[ -x "${_vp_bin}" ]] || return 1
+  local _ver
+  _ver="$(VP_NODE_MANAGER=no VP_ENV_FORBIDDEN=1 "${_vp_bin}" --version </dev/null 2>/dev/null | grep -oE 'vp v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+  [[ -n "${_ver}" ]] || return 1
+  python3 -c 'import re, sys
+def p(s):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", s)
+    return tuple(int(x) for x in m.groups()) if m else None
+found = p(sys.argv[1])
+req = p(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+if found is None:
+    sys.exit(1)
+if req is not None:
+    sys.exit(0 if (found[0] == req[0] and found >= req) else 1)
+sys.exit(0 if (found[0] == 1 and found >= (1, 4, 0)) else 1)' "${_ver}" "${_req_ver}"
+}
+
+_t3clean_ensure_vp() {
+  local _src_dir="${1:-.}"
+  local _req_vp _vp_spec
+  _req_vp="$(_t3clean_required_vp_version "${_src_dir}")"
+  if [[ -n "${_req_vp}" ]]; then
+    _vp_spec="vite-plus@${_req_vp}"
+  else
+    _vp_spec="vite-plus@^1.4.0"
+  fi
+
+  local _sys_vp
+  _sys_vp="$(command -v vp 2>/dev/null || true)"
+  if [[ -n "${_sys_vp}" ]] && _t3clean_vp_ok "${_sys_vp}" "${_req_vp}"; then
+    return 0
+  fi
+
+  local _cache_dir _vp_prefix _legacy_prefix
+  _cache_dir="$(_t3clean_cache_dir)"
+  _legacy_prefix="${_cache_dir}/toolchains/vp-isolated"
+  if [[ -n "${_req_vp}" ]]; then
+    _vp_prefix="${_cache_dir}/toolchains/vp-isolated-v${_req_vp}"
+    if _t3clean_vp_ok "${_vp_prefix}/bin/vp" "${_req_vp}"; then
+      export PATH="${_vp_prefix}/bin:${PATH}"
+      return 0
+    fi
+    if _t3clean_vp_ok "${_legacy_prefix}/bin/vp" "${_req_vp}"; then
+      export PATH="${_legacy_prefix}/bin:${PATH}"
+      return 0
+    fi
+  else
+    _vp_prefix="${_legacy_prefix}"
+    if _t3clean_vp_ok "${_vp_prefix}/bin/vp" ""; then
+      export PATH="${_vp_prefix}/bin:${PATH}"
+      return 0
+    fi
+  fi
+
+  mkdir -p "${_vp_prefix}"
+  VP_NODE_MANAGER=no npm install --global --prefix "${_vp_prefix}" "${_vp_spec}" </dev/null
+  export PATH="${_vp_prefix}/bin:${PATH}"
+}'''
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_url(url: str) -> str:
+    """Stream ``url`` and return its lowercase SHA-256 hex digest without storing a file."""
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"{PKGNAME}/t3clean"},
+    )
+    digest = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"Failed to download {url} to compute SHA-256: {exc}") from exc
+    return digest.hexdigest().lower()
+
+
+def resolve_source_sha256(
+    upstream_ref: str,
+    *,
+    source_sha256: str | None = None,
+    source_tarball: Path | None = None,
+) -> str:
+    """Resolve the upstream tarball SHA-256 checksum for ``PKGBUILD`` and ``.SRCINFO``.
+
+    Accepts:
+    - ``source_tarball``: computes SHA-256 from an already-downloaded local archive file.
+    - ``source_sha256="auto"``: streams the GitHub archive URL for ``upstream_ref`` to compute SHA-256.
+    - ``source_sha256="<64-hex>"``: validates and normalizes an explicit SHA-256 hex digest.
+    - ``source_sha256="SKIP"`` or ``None``: emits ``"SKIP"``.
+    """
+    if source_sha256 is not None and source_tarball is not None:
+        raise ValueError("Cannot specify both source_sha256 and source_tarball; choose one.")
+
+    if source_tarball is not None:
+        tarball_path = Path(source_tarball).expanduser().resolve()
+        if not tarball_path.is_file():
+            raise FileNotFoundError(f"Source tarball not found: {tarball_path}")
+        return _sha256_file(tarball_path)
+
+    if source_sha256 is None:
+        return "SKIP"
+
+    cleaned = source_sha256.strip()
+    if not cleaned:
+        raise ValueError(
+            "source_sha256 must not be empty; pass a 64-character hex SHA-256, 'auto', or 'SKIP'."
+        )
+    if cleaned.upper() == "SKIP":
+        return "SKIP"
+    if cleaned.lower() == "auto":
+        _, archive_url = _github_archive_source(upstream_ref)
+        return _sha256_url(archive_url)
+    if _SHA256_HEX_RE.fullmatch(cleaned):
+        return cleaned.lower()
+
+    raise ValueError(
+        f"Invalid source_sha256 {source_sha256!r}: expected 64 hex characters, 'auto', or 'SKIP'."
+    )
 
 
 def _strip_module_for_bundle(source: str, label: str) -> tuple[set[str], str]:
@@ -332,6 +521,7 @@ def _render_flat_pkgbuild(
     upstream_ref: str,
     pkgver: str,
     pkgrel: int,
+    sha_source: str,
     sha_standalone: str,
     sha_launcher: str,
     sha_desktop: str,
@@ -357,7 +547,7 @@ license=('MIT')
 options=({options_str})
 
 # Pinned upstream ref: {upstream_ref}
-# (Re-run `python3 t3clean.py export-aur --ref <ref>` to switch refs for AUR uploads.)
+# (Re-run `python3 t3clean.py export-aur --ref <ref> --source-sha256 auto` for AUR uploads.)
 # Optional build switches (all disabled by default for reproducible AUR builds)
 _build_deb="${{T3CLEAN_BUILD_DEB:-0}}"
 _use_system_electron="${{T3CLEAN_USE_SYSTEM_ELECTRON:-0}}"
@@ -372,8 +562,9 @@ if [[ "${{_use_system_electron}}" == "1" ]]; then
   depends+=("${{_system_electron_bin}}")
 fi
 
-# All makedepends are in official Arch/CachyOS repos; vp >= 1.4.0 is reused from
-# PATH or installed into the build cache via host npm (avoids rustup conflicts).
+# All makedepends are in official Arch/CachyOS repos; vp is reused from PATH when
+# compatible or installed into the build cache via host npm pinned to upstream's
+# pnpm-workspace.yaml catalog version (fallback: vite-plus@^1.4.0, avoids rustup conflicts).
 {makedepends_block}
 {optdepends_block}
 
@@ -386,7 +577,7 @@ source=(
   "t3-code-no-telemetry.desktop"
 )
 sha256sums=(
-  'SKIP'
+  '{sha_source}'
   '{sha_standalone}'
   '{sha_launcher}'
   '{sha_desktop}'
@@ -436,31 +627,7 @@ _t3clean_cache_dir() {{
   fi
 }}
 
-_t3clean_vp_ok() {{
-  local _vp_bin="$1"
-  [[ -x "${{_vp_bin}}" ]] || return 1
-  local _ver
-  _ver="$(VP_NODE_MANAGER=no VP_ENV_FORBIDDEN=1 "${{_vp_bin}}" --version </dev/null 2>/dev/null | grep -oE 'vp v?[0-9]+\\.[0-9]+\\.[0-9]+' | head -n1 | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+')"
-  [[ -n "${{_ver}}" ]] || return 1
-  python3 -c 'import sys; v=tuple(int(x) for x in sys.argv[1].split(".")); sys.exit(0 if v >= (1, 4, 0) else 1)' "${{_ver}}"
-}}
-
-_t3clean_ensure_vp() {{
-  local _sys_vp
-  _sys_vp="$(command -v vp 2>/dev/null || true)"
-  if [[ -n "${{_sys_vp}}" ]] && _t3clean_vp_ok "${{_sys_vp}}"; then
-    return 0
-  fi
-  local _cache_dir _vp_prefix _vp_bin
-  _cache_dir="$(_t3clean_cache_dir)"
-  _vp_prefix="${{_cache_dir}}/toolchains/vp-isolated"
-  _vp_bin="${{_vp_prefix}}/bin/vp"
-  if ! _t3clean_vp_ok "${{_vp_bin}}"; then
-    mkdir -p "${{_vp_prefix}}"
-    VP_NODE_MANAGER=no npm install --global --prefix "${{_vp_prefix}}" vite-plus </dev/null
-  fi
-  export PATH="${{_vp_prefix}}/bin:${{PATH}}"
-}}
+{_AUR_VP_HELPERS}
 
 _t3clean_scrub_env() {{
   local _var
@@ -579,7 +746,7 @@ build() {{
   export GIT_CEILING_DIRECTORIES="${{GIT_CEILING_DIRECTORIES:+${{GIT_CEILING_DIRECTORIES}}:}}$(dirname "${{_src_dir}}")"
   _t3clean_scrub_env
   _t3clean_apply_memory_guards
-  _t3clean_ensure_vp
+  _t3clean_ensure_vp "${{_src_dir}}"
 
   local _arch _build_ver
   _arch="$(_t3clean_arch)"
@@ -701,6 +868,7 @@ def _render_srcinfo(
     upstream_ref: str,
     pkgver: str,
     pkgrel: int,
+    sha_source: str,
     sha_standalone: str,
     sha_launcher: str,
     sha_desktop: str,
@@ -730,7 +898,7 @@ def _render_srcinfo(
             "\tsource = t3clean-standalone.py",
             "\tsource = t3-code-no-telemetry.sh",
             "\tsource = t3-code-no-telemetry.desktop",
-            "\tsha256sums = SKIP",
+            f"\tsha256sums = {sha_source}",
             f"\tsha256sums = {sha_standalone}",
             f"\tsha256sums = {sha_launcher}",
             f"\tsha256sums = {sha_desktop}",
@@ -748,6 +916,8 @@ def export_aur_package(
     *,
     upstream_ref: str = DEFAULT_REF,
     pkgrel: int = 1,
+    source_sha256: str | None = None,
+    source_tarball: Path | None = None,
 ) -> list[Path]:
     """Generate a 100% flat, zero-subdirectory AUR package directory.
 
@@ -757,6 +927,13 @@ def export_aur_package(
         raise ValueError(f"pkgrel must be >= 1, got {pkgrel}")
     if not upstream_ref or not upstream_ref.strip():
         raise ValueError("upstream_ref must be a non-empty Git ref")
+
+    cleaned_ref = upstream_ref.strip()
+    sha_source = resolve_source_sha256(
+        cleaned_ref,
+        source_sha256=source_sha256,
+        source_tarball=source_tarball,
+    )
 
     repo_root = Path(repo_root).resolve()
     out_dir = Path(out_dir).resolve()
@@ -788,15 +965,16 @@ def export_aur_package(
     sha_launcher = _sha256_file(launcher_path)
     sha_desktop = _sha256_file(desktop_path)
 
-    pkgver = _pkgver_for_ref(upstream_ref)
+    pkgver = _pkgver_for_ref(cleaned_ref)
 
     # 4. Write flat PKGBUILD and matching .SRCINFO.
     pkgbuild_path = out_dir / "PKGBUILD"
     pkgbuild_path.write_text(
         _render_flat_pkgbuild(
-            upstream_ref=upstream_ref.strip(),
+            upstream_ref=cleaned_ref,
             pkgver=pkgver,
             pkgrel=pkgrel,
+            sha_source=sha_source,
             sha_standalone=sha_standalone,
             sha_launcher=sha_launcher,
             sha_desktop=sha_desktop,
@@ -807,9 +985,10 @@ def export_aur_package(
     srcinfo_path = out_dir / ".SRCINFO"
     srcinfo_path.write_text(
         _render_srcinfo(
-            upstream_ref=upstream_ref.strip(),
+            upstream_ref=cleaned_ref,
             pkgver=pkgver,
             pkgrel=pkgrel,
+            sha_source=sha_source,
             sha_standalone=sha_standalone,
             sha_launcher=sha_launcher,
             sha_desktop=sha_desktop,

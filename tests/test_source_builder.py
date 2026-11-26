@@ -17,6 +17,7 @@ from unittest import mock
 from t3clean import DEFAULT_NODE_VERSION
 from t3clean.builder import (
     BuildOptions,
+    DEFAULT_VP_FALLBACK_SPEC,
     HostMemoryInfo,
     VALID_TARGETS,
     apply_concurrency_env,
@@ -33,6 +34,7 @@ from t3clean.source import (
     fetch_source,
     pick_latest_stable_tag,
     read_required_node_version,
+    read_required_vp_version,
     read_source_version,
     resolve_latest_stable_tag,
 )
@@ -176,6 +178,62 @@ class SourceTests(unittest.TestCase):
                 json.dumps({"engines": {"node": "^22.16 || >=24.10"}}), encoding="utf-8"
             )
             self.assertEqual(read_required_node_version(src), DEFAULT_NODE_VERSION)
+
+    def test_read_required_vp_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            self.assertIsNone(read_required_vp_version(src))
+
+            # Upstream layout: catalog.vite-plus with overrides referencing "catalog:"
+            (src / "pnpm-workspace.yaml").write_text(
+                "packages:\n"
+                "  - apps/*\n\n"
+                "catalog:\n"
+                "  vite: npm:@voidzero-dev/vite-plus-core@8.3.8001\n"
+                "  vite-plus: 1.8.0\n\n"
+                "overrides:\n"
+                '  vite-plus: "catalog:"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(read_required_vp_version(src), "1.8.0")
+
+            # Quoted range + inline comment
+            (src / "pnpm-workspace.yaml").write_text(
+                "catalog:\n"
+                '  "vite-plus": "^1.8.2" # pinned for build\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(read_required_vp_version(src), "1.8.2")
+
+            # Prerelease tag
+            (src / "pnpm-workspace.yaml").write_text(
+                "catalog:\n"
+                "  'vite-plus': '1.9.0-rc.1'\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(read_required_vp_version(src), "1.9.0-rc.1")
+
+            # Missing from catalog (only under overrides) -> falls back to package.json
+            (src / "pnpm-workspace.yaml").write_text(
+                "catalog:\n"
+                "  react: 19.3.0\n"
+                "overrides:\n"
+                "  vite-plus: 9.9.9\n",
+                encoding="utf-8",
+            )
+            (src / "package.json").write_text(
+                json.dumps({"devDependencies": {"vite-plus": "^1.7.0"}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(read_required_vp_version(src), "1.7.0")
+
+            # package.json with "catalog:" specifier only -> None
+            (src / "pnpm-workspace.yaml").unlink()
+            (src / "package.json").write_text(
+                json.dumps({"devDependencies": {"vite-plus": "catalog:"}}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(read_required_vp_version(src))
 
     def test_fetch_source_clone_latest_stable_and_refetch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,8 +381,11 @@ class BuilderTests(unittest.TestCase):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(tarball_bytes)
 
+            npm_cmds: list[list[str]] = []
+
             def fake_subprocess_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                 if cmd[0].endswith("/npm"):
+                    npm_cmds.append(cmd)
                     prefix = Path(cmd[cmd.index("--prefix") + 1])
                     vp = prefix / "bin" / "vp"
                     vp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -347,6 +408,7 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(bin_dir, (cache_root / "toolchains" / stem / "bin").resolve())
             self.assertTrue((bin_dir / "node").is_file())
             self.assertTrue((bin_dir / "vp").is_file())
+            self.assertEqual(npm_cmds[0][-1], DEFAULT_VP_FALLBACK_SPEC)
 
     def test_ensure_isolated_toolchain_rejects_bad_sha256(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -409,11 +471,81 @@ class BuilderTests(unittest.TestCase):
                 self.assertEqual(bin_dir, (cache_root / "toolchains" / "vp-isolated" / "bin").resolve())
                 self.assertTrue((bin_dir / "vp").is_file())
                 self.assertEqual(len(npm_calls), 1)
+                self.assertEqual(npm_calls[0][-1], DEFAULT_VP_FALLBACK_SPEC)
 
                 # Second call reuses cached vp >= 1.4.0 without running npm again.
                 bin_dir2 = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64")
                 self.assertEqual(bin_dir2, bin_dir)
                 self.assertEqual(len(npm_calls), 1)
+
+    def test_ensure_isolated_toolchain_pins_vp_version_and_blocks_major_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_root = Path(tmp) / "cache"
+            npm_calls: list[list[str]] = []
+            vp_versions: dict[str, str] = {"/usr/bin/vp": "vp v2.0.0\n"}
+
+            def fake_which(name: str, **_kwargs: object) -> str | None:
+                return {"node": "/usr/bin/node", "npm": "/usr/bin/npm", "vp": "/usr/bin/vp"}.get(name)
+
+            def fake_subprocess_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if cmd == ["/usr/bin/node", "-v"]:
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="v26.13.1\n", stderr="")
+                if len(cmd) == 2 and cmd[1] == "--version":
+                    return subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=0,
+                        stdout=vp_versions.get(cmd[0], ""),
+                        stderr="",
+                    )
+                if cmd[0] == "/usr/bin/npm":
+                    npm_calls.append(cmd)
+                    prefix = Path(cmd[cmd.index("--prefix") + 1])
+                    spec = cmd[-1]
+                    vp = prefix / "bin" / "vp"
+                    vp.parent.mkdir(parents=True, exist_ok=True)
+                    vp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    vp.chmod(0o755)
+                    installed_ver = spec.split("@", 1)[1].lstrip("^")
+                    vp_versions[str(vp)] = f"vp v{installed_ver}\n"
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with (
+                mock.patch("t3clean.builder.shutil.which", side_effect=fake_which),
+                mock.patch("t3clean.builder._download_bytes", side_effect=AssertionError("must not download Node")),
+                mock.patch("t3clean.builder.subprocess.run", side_effect=fake_subprocess_run),
+            ):
+                # 1. Host vp 2.0.0 is rejected for pinned 1.8.0; installs exact vite-plus@1.8.0.
+                bin_18 = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64", vp_version="1.8.0")
+                self.assertEqual(bin_18, (cache_root / "toolchains" / "vp-isolated-v1.8.0" / "bin").resolve())
+                self.assertEqual(npm_calls[-1][-1], "vite-plus@1.8.0")
+
+                # 2. Second call reuses vp-isolated-v1.8.0 without running npm again.
+                bin_18_again = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64", vp_version="1.8.0")
+                self.assertEqual(bin_18_again, bin_18)
+                self.assertEqual(len(npm_calls), 1)
+
+                # 3. Unpinned fallback also rejects host vp 2.0.0 and installs vite-plus@^1.4.0.
+                bin_fallback = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64", vp_version=None)
+                self.assertEqual(bin_fallback, (cache_root / "toolchains" / "vp-isolated" / "bin").resolve())
+                self.assertEqual(npm_calls[-1][-1], DEFAULT_VP_FALLBACK_SPEC)
+
+                # 4. Future upstream bump to 2.1.0 rejects host 2.0.0 (< 2.1.0) and installs vite-plus@2.1.0.
+                bin_21 = ensure_isolated_toolchain(cache_root, "26.13.1", arch="x64", vp_version="2.1.0")
+                self.assertEqual(bin_21, (cache_root / "toolchains" / "vp-isolated-v2.1.0" / "bin").resolve())
+                self.assertEqual(npm_calls[-1][-1], "vite-plus@2.1.0")
+
+                # 5. Reuses compatible legacy toolchains/vp-isolated when versioned dir does not exist.
+                legacy_cache = Path(tmp) / "legacy-cache"
+                legacy_vp = legacy_cache / "toolchains" / "vp-isolated" / "bin" / "vp"
+                legacy_vp.parent.mkdir(parents=True)
+                legacy_vp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                legacy_vp.chmod(0o755)
+                vp_versions[str(legacy_vp.resolve())] = "vp v1.8.0\n"
+                before_npm = len(npm_calls)
+                reused_legacy = ensure_isolated_toolchain(legacy_cache, "26.13.1", arch="x64", vp_version="1.8.0")
+                self.assertEqual(reused_legacy, legacy_vp.parent.resolve())
+                self.assertEqual(len(npm_calls), before_npm)
 
     def test_ensure_isolated_toolchain_reuses_host_node_and_modern_vp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -609,6 +741,9 @@ class BuilderTests(unittest.TestCase):
             (src / "package.json").write_text(
                 json.dumps({"engines": {"node": "26.13.1"}}), encoding="utf-8"
             )
+            (src / "pnpm-workspace.yaml").write_text(
+                "catalog:\n  vite-plus: 1.8.0\n", encoding="utf-8"
+            )
 
             def fake_run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> None:
                 if cmd == ["vp", "run", "--filter", "t3", "build"]:
@@ -619,7 +754,7 @@ class BuilderTests(unittest.TestCase):
                     (dist / "client" / "index.html").write_text("<html></html>\n", encoding="utf-8")
 
             with (
-                mock.patch("t3clean.builder.ensure_isolated_toolchain", return_value=fake_toolchain_bin),
+                mock.patch("t3clean.builder.ensure_isolated_toolchain", return_value=fake_toolchain_bin) as ensure_mock,
                 mock.patch("t3clean.builder._run_cmd", side_effect=fake_run),
                 mock.patch(
                     "t3clean.builder.verify_artifact",
@@ -637,6 +772,9 @@ class BuilderTests(unittest.TestCase):
                         skip_install=True,
                     )
                 )
+
+            ensure_mock.assert_called_once()
+            self.assertEqual(ensure_mock.call_args.kwargs.get("vp_version"), "1.8.0")
 
             self.assertEqual(artifact, out / "t3-0.1.12+notelemetry-linux-x64-bundle.tar.gz")
             self.assertTrue(artifact.is_file())

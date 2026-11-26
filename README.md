@@ -79,7 +79,7 @@
 ## CachyOS / Arch Linux 本地 `makepkg` 构建
 
 仓库内置的 [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) 为薄包装脚本，直接调用根目录的 `t3clean.py`：
-- **零 AUR 构建依赖**：所有 `makedepends` 均来自 Arch/CachyOS 官方源；构建时若系统未安装 `vp >= 1.4.0`，会自动使用宿主机 `npm` 将最新预编译版 `vite-plus` 隔离安装到缓存目录（避免 AUR `vite-plus-bin` 过旧或源码版 `vite-plus` 与系统 `rust` 的 `rustup` 冲突）。
+- **零 AUR 构建依赖**：所有 `makedepends` 均来自 Arch/CachyOS 官方源；构建时优先读取上游 `pnpm-workspace.yaml` 的 `catalog.vite-plus` 版本（如 `1.8.0`，兜底锁定主版本 `vite-plus@^1.4.0` 防未来 2.x 破坏性升级），若系统 `vp` 缺失或主版本不匹配，自动使用宿主机 `npm` 隔离安装到缓存目录（避免 AUR `vite-plus-bin` 过旧或源码版 `vite-plus` 与系统 `rust` 的 `rustup` 冲突）。
 - **轻量源码压缩包**：直接下载 GitHub `archive/refs/tags/v0.1.12.tar.gz`（仅几十 MB），避开 `makepkg` `git+https://` 全量 `--mirror`（~3.5 GiB）。
 - 不依赖 `fuse2`，且与官方 `t3code-bin` 完全共存。
 
@@ -149,12 +149,21 @@ makepkg -s
 AUR Git 仓库要求所有源文件位于顶层目录，不允许存在 `../../` 相对引用或子目录。使用 `export-aur` 可一键生成 **100% 扁平、零子目录、可直接 `git push` 到 AUR** 的目录：
 
 ```bash
+# 本地预览 / 快速导出（默认源码压缩包校验和为 SKIP）
 ./t3clean.py export-aur --out /tmp/aur-t3-code-no-telemetry --ref v0.1.12 --pkgrel 1
+
+# 正式推送公开 AUR（推荐）：写入上游源码压缩包的真实 SHA-256（三选一）
+# 方式 1：流式拉取 GitHub 归档并自动计算 SHA-256（不落盘大文件）
+./t3clean.py export-aur --out /tmp/aur-t3-code-no-telemetry --ref v0.1.12 --pkgrel 1 --source-sha256 auto
+# 方式 2：复用本机已下载的源码压缩包（零重复下载）
+./t3clean.py export-aur --out /tmp/aur-t3-code-no-telemetry --ref v0.1.12 --pkgrel 1 --source-tarball packaging/arch/t3code-v0.1.12.tar.gz
+# 方式 3：直接传入已知的 64 位 SHA-256
+./t3clean.py export-aur --out /tmp/aur-t3-code-no-telemetry --ref v0.1.12 --pkgrel 1 --source-sha256 <64-hex-sha256>
 ```
 
 导出目录仅包含以下 5 个顶层文件：
 
-1. `PKGBUILD` — 自包含构建脚本，无任何 `../` 路径，内置全部本地文件的真实 `sha256sums`
+1. `PKGBUILD` — 自包含构建脚本，无任何 `../` 路径，内置全部本地文件（以及可选的上游源码归档）的真实 `sha256sums`，并自动按上游 `pnpm-workspace.yaml` 锁定隔离 `vite-plus` 版本（兜底 `^1.4.0`）
 2. `.SRCINFO` — 与 `PKGBUILD` 元数据、源文件与校验和完全一致
 3. `t3clean-standalone.py` — 由 `t3clean/__init__.py`、`t3clean/patcher.py`、`t3clean/verifier.py` 自动合并生成的独立单文件 CLI（支持 `patch` 与 `verify`）
 4. `t3-code-no-telemetry.sh` — Wayland/X11 自动检测与防御性环境变量启动脚本
@@ -163,7 +172,7 @@ AUR Git 仓库要求所有源文件位于顶层目录，不允许存在 `../../`
 若已克隆 AUR 仓库，可直接将 `--out` 指向该仓库目录（不会删除 `.git/`）：
 
 ```bash
-./t3clean.py export-aur --out ~/aur/t3-code-no-telemetry --ref v0.1.12 --pkgrel 1
+./t3clean.py export-aur --out ~/aur/t3-code-no-telemetry --ref v0.1.12 --pkgrel 1 --source-sha256 auto
 ```
 
 ---

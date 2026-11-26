@@ -1,0 +1,247 @@
+name: Check Upstream Release
+
+on:
+  schedule:
+    # Run daily at 04:00 UTC (12:00 CST)
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Optional upstream ref (e.g. v0.1.13 or v0.1.13-nightly.20261125.5258)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: update-check
+  cancel-in-progress: false
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install Arch packaging and verification tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git namcap python curl
+
+      - name: Checkout dev branch
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+
+      - name: Configure non-root builder for makepkg
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder || true
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Resolve upstream target release
+        id: target
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          current_ver="$(grep -E '^pkgver=' aur/PKGBUILD | head -n 1 | cut -d= -f2- | tr -d "'\"")"
+          echo "current_ver=${current_ver}" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${INPUT_REF:-}" ]]; then
+            target_ref="${INPUT_REF}"
+            target_ver="${target_ref#v}"
+            target_url="https://github.com/pingdotgg/t3code/releases/tag/${target_ref}"
+            echo "ref=${target_ref}" >> "$GITHUB_OUTPUT"
+            echo "version=${target_ver}" >> "$GITHUB_OUTPUT"
+            echo "html_url=${target_url}" >> "$GITHUB_OUTPUT"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 ./t3clean.py latest-release --json > /tmp/latest-release.json
+          target_ref="$(python3 -c 'import json; print(json.load(open("/tmp/latest-release.json"))["tag"])')"
+          target_ver="$(python3 -c 'import json; print(json.load(open("/tmp/latest-release.json"))["version"])')"
+          target_url="$(python3 -c 'import json; print(json.load(open("/tmp/latest-release.json"))["html_url"])')"
+
+          echo "ref=${target_ref}" >> "$GITHUB_OUTPUT"
+          echo "version=${target_ver}" >> "$GITHUB_OUTPUT"
+          echo "html_url=${target_url}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${target_ver}" == "${current_ver}" ]]; then
+            echo "==> Already up to date at v${current_ver}."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "==> Found new upstream release: v${current_ver} -> ${target_ref}"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Regenerate AUR patches, PKGBUILD, .SRCINFO and verify
+        id: export
+        if: steps.target.outputs.should_run == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          TARGET_REF: ${{ steps.target.outputs.ref }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          log_file="/tmp/update-check-error.log"
+          : > "${log_file}"
+
+          run_step() {
+            local desc="$1"
+            shift
+            echo "==> ${desc}"
+            if ! "$@" 2>&1 | tee -a "${log_file}"; then
+              echo "STEP_FAILED: ${desc}" >> "${log_file}"
+              return 1
+            fi
+          }
+
+          echo "==> Exporting AUR files for ${TARGET_REF}"
+          if ! python3 ./t3clean.py export-aur --out aur --ref "${TARGET_REF}" --pkgrel 1 --json > /tmp/export-aur.json 2>> "${log_file}"; then
+            cat /tmp/export-aur.json >> "${log_file}" 2>/dev/null || true
+            cat "${log_file}" >&2
+            exit 1
+          fi
+
+          # Keep DEFAULT_REF aligned with stable vX.Y.Z tags.
+          if [[ "${TARGET_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            python3 - "${TARGET_REF}" <<'PY'
+          import pathlib, re, sys
+          target_ref = sys.argv[1]
+          init_path = pathlib.Path("t3clean/__init__.py")
+          text = init_path.read_text(encoding="utf-8")
+          updated, count = re.subn(
+              r'^DEFAULT_REF\s*=\s*"[^"]+"',
+              f'DEFAULT_REF = "{target_ref}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("Failed to update DEFAULT_REF in t3clean/__init__.py")
+          init_path.write_text(updated, encoding="utf-8")
+          PY
+          fi
+
+          run_step "Run unit test suite" python3 -W error::SyntaxWarning -m unittest discover -s tests -v
+          run_step "Check PKGBUILD bash syntax" bash -n aur/PKGBUILD
+          chown -R builder:builder "$GITHUB_WORKSPACE/aur"
+          run_step "Verify .SRCINFO matches makepkg --printsrcinfo" \
+            su -w GITHUB_WORKSPACE builder -c 'cd "$GITHUB_WORKSPACE/aur" && diff -u .SRCINFO <(makepkg --printsrcinfo)'
+          run_step "Run namcap on aur/PKGBUILD" namcap aur/PKGBUILD
+
+          python3 - /tmp/export-aur.json "$GITHUB_OUTPUT" "${{ steps.target.outputs.html_url }}" <<'PY'
+          import json, pathlib, sys
+          data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          out_path = pathlib.Path(sys.argv[2])
+          release_url = sys.argv[3]
+          with out_path.open("a", encoding="utf-8") as fh:
+              fh.write(f"pkgver={data['pkgver']}\n")
+              fh.write(f"vp_version={data.get('vp_version') or 'fallback ^1.4.0'}\n")
+              fh.write(f"source_sha256={data['source_sha256']}\n")
+              fh.write(f"verified_files={data['verified_files']}\n")
+
+          audit_files = data.get("audit_files") or []
+          audit_md = "\n".join(f"- `{p}`" for p in audit_files) if audit_files else "- *(none)*"
+          patch_md = "\n".join(f"- `{p}`" for p in data.get("patch_files") or [])
+          body = f"""Automated upstream release check for **T3 Code {data['resolved_ref']}** ({release_url}).
+
+          ### Verification performed
+          - Resolved upstream source archive `{data['source_archive']}` (`sha256`: `{data['source_sha256']}`)
+          - Pinned isolated Vite+ CLI version from upstream `pnpm-workspace.yaml`: `{data.get('vp_version') or 'fallback ^1.4.0'}`
+          - Generated standard unified patch series and verified clean GNU `patch -Np1` apply:
+          {patch_md}
+          - Verified patched upstream source tree ({data['verified_files']} scanned files, **0 telemetry findings**)
+          - Verified `aur/.SRCINFO` matches `makepkg --printsrcinfo` byte-for-byte, `bash -n aur/PKGBUILD`, `namcap`, and `unittest`
+
+          ### Upstream `telemetry/` and `cloud/` files to audit in this release
+          {audit_md}
+
+          > **Note:** Review the `.patch` diff and audit list above (and run a local `makepkg` build if desired). Merging this PR into `dev` will automatically sync `aur/` to orphan `master` and publish a lightweight recipe GitHub Release.
+          """
+          pathlib.Path("/tmp/pr-body.md").write_text(body, encoding="utf-8")
+          PY
+
+      - name: Report patch failure via deduplicated GitHub Issue
+        if: steps.target.outputs.should_run == 'true' && steps.export.outcome == 'failure'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_REF: ${{ steps.target.outputs.ref }}
+          TARGET_URL: ${{ steps.target.outputs.html_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GITHUB_TOKEN"]
+          target_ref = os.environ["TARGET_REF"]
+          target_url = os.environ["TARGET_URL"]
+          run_url = os.environ["RUN_URL"]
+          title = f"[{target_ref}] Automated de-telemetry patch failed"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "t3-code-no-telemetry-bot",
+          }
+
+          list_req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues?state=open&per_page=100",
+              headers=headers,
+          )
+          with urllib.request.urlopen(list_req, timeout=30) as resp:
+              open_issues = json.loads(resp.read().decode("utf-8"))
+
+          if any(issue.get("title") == title for issue in open_issues):
+              print(f"Open failure issue already exists for {target_ref}; skipping duplicate.")
+              raise SystemExit(0)
+
+          log_path = pathlib.Path("/tmp/update-check-error.log")
+          raw_log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+          tail = "\n".join(raw_log.splitlines()[-60:]).strip() or "(see workflow logs)"
+
+          body = (
+              f"Automated update check for upstream **{target_ref}** ({target_url}) failed.\n\n"
+              f"Workflow run: {run_url}\n\n"
+              f"### Error tail\n```text\n{tail}\n```\n\n"
+              f"### Reproduce locally\n```bash\n"
+              f"./t3clean.py fetch --ref {target_ref} --dest /tmp/t3-check\n"
+              f"./t3clean.py patch --source /tmp/t3-check --dry-run\n"
+              f"```\n"
+          )
+          payload = json.dumps(
+              {"title": title, "body": body, "assignees": ["LYB926"]}
+          ).encode("utf-8")
+          create_req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues",
+              data=payload,
+              headers={**headers, "Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(create_req, timeout=30) as resp:
+              created = json.loads(resp.read().decode("utf-8"))
+              print(f"Created failure issue: {created.get('html_url')}")
+          PY
+          exit 1
+
+      - name: Create Pull Request for human review
+        if: steps.target.outputs.should_run == 'true' && steps.export.outcome == 'success'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          base: dev
+          branch: update/${{ steps.target.outputs.ref }}
+          delete-branch: true
+          assignees: LYB926
+          commit-message: "chore(aur): update t3-code-no-telemetry to ${{ steps.target.outputs.ref }}"
+          title: "Update t3-code-no-telemetry to ${{ steps.target.outputs.ref }}"
+          body-path: /tmp/pr-body.md

@@ -56,7 +56,7 @@ _VERIFY_TEXT_EXTENSIONS = frozenset(
     }
 )
 
-_VERIFY_SKIP_DIRS = frozenset({".git", "__pycache__"})
+_VERIFY_SKIP_DIRS = frozenset({".git", ".repos", "__pycache__"})
 _VERIFY_TEST_FILE_SUFFIXES = (
     ".test.ts",
     ".test.tsx",

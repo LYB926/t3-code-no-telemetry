@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import DEFAULT_NODE_VERSION, DEFAULT_REF, DEFAULT_REPO_URL
@@ -78,6 +81,65 @@ def pick_latest_stable_tag(ls_remote_output: str) -> str:
 
     candidates.sort(key=lambda item: item[0])
     return candidates[-1][1]
+
+
+_GITHUB_SLUG_RE = re.compile(
+    r"github\.com[:/](?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+
+
+def parse_github_repo_slug(repo_url: str = DEFAULT_REPO_URL) -> tuple[str, str]:
+    """Extract ``(owner, repo)`` from a GitHub HTTPS or SSH repository URL."""
+    match = _GITHUB_SLUG_RE.search(repo_url.strip())
+    if match is None:
+        raise ValueError(f"Unsupported GitHub repository URL: {repo_url!r}")
+    return match.group("owner"), match.group("repo")
+
+
+def resolve_latest_github_release(
+    repo_url: str = DEFAULT_REPO_URL,
+    *,
+    token: str | None = None,
+) -> dict[str, str]:
+    """Query GitHub Releases API ``/releases/latest`` for the newest stable release.
+
+    Validates that the returned release is neither a draft nor a prerelease, and that
+    its ``tag_name`` is a clean stable SemVer tag (``vX.Y.Z`` without nightly/preview).
+    Returns ``{"tag", "version", "html_url", "published_at"}``.
+    """
+    owner, repo = parse_github_repo_slug(repo_url)
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "t3-code-no-telemetry/t3clean",
+    }
+    auth_token = (token or os.environ.get("GITHUB_TOKEN") or "").strip()
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    req = urllib.request.Request(api_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to query latest GitHub release from {api_url}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected GitHub release payload from {api_url}")
+    if payload.get("draft") or payload.get("prerelease"):
+        raise ValueError(f"Latest GitHub release is marked draft/prerelease: {payload.get('tag_name')!r}")
+
+    tag = str(payload.get("tag_name") or "").strip()
+    lowered = tag.lower()
+    if any(marker in lowered for marker in _EXCLUDED_TAG_MARKERS) or _STABLE_TAG_RE.match(tag) is None:
+        raise ValueError(f"Latest GitHub release tag is not a stable SemVer tag: {tag!r}")
+
+    return {
+        "tag": tag,
+        "version": tag.lstrip("v"),
+        "html_url": str(payload.get("html_url") or f"https://github.com/{owner}/{repo}/releases/tag/{tag}"),
+        "published_at": str(payload.get("published_at") or ""),
+    }
 
 
 def resolve_latest_stable_tag(repo_url: str = DEFAULT_REPO_URL) -> str:
@@ -312,11 +374,17 @@ def fetch_source(
 ) -> dict[str, str]:
     """Shallow-clone or shallow-fetch ``repo_url`` at ``ref`` into ``dest``.
 
-    When ``ref == "latest-stable"``, queries ``resolve_latest_stable_tag(repo_url)``.
+    Supports ``ref == "latest-release"`` (GitHub Releases API) and
+    ``ref == "latest-stable"`` (git ls-remote SemVer tags).
     Returns ``{"ref", "resolved_ref", "commit", "version"}``.
     """
     dest_path = Path(dest).expanduser().resolve()
-    resolved_ref = resolve_latest_stable_tag(repo_url) if ref == "latest-stable" else ref
+    if ref == "latest-release":
+        resolved_ref = resolve_latest_github_release(repo_url)["tag"]
+    elif ref == "latest-stable":
+        resolved_ref = resolve_latest_stable_tag(repo_url)
+    else:
+        resolved_ref = ref
 
     if (dest_path / ".git").exists():
         _fetch_shallow_ref(dest_path, repo_url, resolved_ref)

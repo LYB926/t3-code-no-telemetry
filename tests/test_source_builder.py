@@ -32,10 +32,12 @@ from t3clean.builder import (
 from t3clean.source import (
     EXACT_SERVICE_VERSION_RE,
     fetch_source,
+    parse_github_repo_slug,
     pick_latest_stable_tag,
     read_required_node_version,
     read_required_vp_version,
     read_source_version,
+    resolve_latest_github_release,
     resolve_latest_stable_tag,
 )
 from t3clean.verifier import Finding, VerifyReport
@@ -130,6 +132,60 @@ class SourceTests(unittest.TestCase):
             cmd,
             ["git", "ls-remote", "--tags", "--refs", "https://example.invalid/repo.git", "v[0-9]*"],
         )
+
+    def test_resolve_latest_github_release_validates_stable_and_auth(self) -> None:
+        self.assertEqual(
+            parse_github_repo_slug("https://github.com/pingdotgg/t3code.git"),
+            ("pingdotgg", "t3code"),
+        )
+
+        class FakeResp:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._raw = json.dumps(payload).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._raw
+
+            def __enter__(self) -> FakeResp:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        seen_reqs: list[object] = []
+
+        def fake_urlopen(req: object, timeout: int = 30) -> FakeResp:
+            seen_reqs.append(req)
+            return FakeResp(
+                {
+                    "tag_name": "v0.1.13",
+                    "draft": False,
+                    "prerelease": False,
+                    "html_url": "https://github.com/pingdotgg/t3code/releases/tag/v0.1.13",
+                    "published_at": "2026-11-26T00:00:00Z",
+                }
+            )
+
+        with mock.patch("t3clean.source.urllib.request.urlopen", side_effect=fake_urlopen):
+            info = resolve_latest_github_release(
+                "https://github.com/pingdotgg/t3code.git",
+                token="ghs_test_token",
+            )
+        self.assertEqual(info["tag"], "v0.1.13")
+        self.assertEqual(info["version"], "0.1.13")
+        self.assertEqual(seen_reqs[0].headers["Authorization"], "Bearer ghs_test_token")
+
+        for bad_payload in (
+            {"tag_name": "v0.1.13", "draft": True, "prerelease": False},
+            {"tag_name": "v0.1.13-nightly.1", "draft": False, "prerelease": True},
+            {"tag_name": "v0.1.13-nightly.1", "draft": False, "prerelease": False},
+        ):
+            with mock.patch(
+                "t3clean.source.urllib.request.urlopen",
+                return_value=FakeResp(bad_payload),
+            ):
+                with self.assertRaises(ValueError):
+                    resolve_latest_github_release("https://github.com/pingdotgg/t3code.git")
 
     def test_read_source_version_variants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,0 +1,192 @@
+name: Sync AUR Files to master & Publish Recipe Release
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - 'aur/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-master
+  cancel-in-progress: false
+
+jobs:
+  sync-master:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dev branch
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Sync flat AUR files to orphan master branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_aur=(
+            PKGBUILD
+            .SRCINFO
+            0001-strip-telemetry.patch
+            0002-linux-build-compat.patch
+            .gitignore
+          )
+          for f in "${required_aur[@]}"; do
+            if [[ ! -f "aur/${f}" ]]; then
+              echo "ERROR: missing required AUR file 'aur/${f}' on dev" >&2
+              exit 1
+            fi
+          done
+          if [[ ! -f LICENSE ]]; then
+            echo "ERROR: missing LICENSE on dev" >&2
+            exit 1
+          fi
+
+          bash -n aur/PKGBUILD
+          if grep -Eq $'^\tsha256sums = SKIP$' aur/.SRCINFO; then
+            echo "ERROR: aur/.SRCINFO contains SKIP checksum; refusing to publish to AUR master." >&2
+            exit 1
+          fi
+
+          pkgver="$(grep -E '^pkgver=' aur/PKGBUILD | head -n 1 | cut -d= -f2- | tr -d "'\"")"
+          pkgrel="$(grep -E '^pkgrel=' aur/PKGBUILD | head -n 1 | cut -d= -f2- | tr -d "'\"")"
+          tag="v${pkgver}-${pkgrel}"
+          dev_sha="$(git rev-parse --short HEAD)"
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          for f in "${required_aur[@]}"; do
+            cp "aur/${f}" "${tmp_dir}/${f}"
+          done
+          cp LICENSE "${tmp_dir}/LICENSE"
+
+          if git ls-remote --exit-code --heads origin master >/dev/null 2>&1; then
+            git fetch origin +refs/heads/master:refs/remotes/origin/master
+            git checkout -B master refs/remotes/origin/master
+          else
+            git checkout --orphan master
+            git rm -rf --quiet .
+          fi
+
+          # Remove any stale tracked files so master strictly matches the allowlist.
+          while IFS= read -r existing; do
+            [[ -n "${existing}" ]] || continue
+            git rm -q -f -- "${existing}"
+          done < <(git ls-files)
+
+          for f in "${required_aur[@]}" LICENSE; do
+            cp "${tmp_dir}/${f}" "./${f}"
+          done
+          git add -- .SRCINFO .gitignore 0001-strip-telemetry.patch 0002-linux-build-compat.patch LICENSE PKGBUILD
+
+          tracked="$(git ls-files | LC_ALL=C sort)"
+          expected="$(printf '%s\n' .SRCINFO .gitignore 0001-strip-telemetry.patch 0002-linux-build-compat.patch LICENSE PKGBUILD)"
+          if [[ "${tracked}" != "${expected}" ]]; then
+            echo "ERROR: unexpected tracked files on master:" >&2
+            printf '%s\n' "${tracked}" >&2
+            exit 1
+          fi
+
+          echo "pkgver=${pkgver}" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=${pkgrel}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse --verify --quiet refs/remotes/origin/master >/dev/null && git diff --cached --quiet; then
+            echo "==> master is already in sync with dev (${pkgver}-${pkgrel})."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m "chore: sync t3-code-no-telemetry ${pkgver}-${pkgrel} from dev (${dev_sha})"
+            git push origin master
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish lightweight AUR recipe GitHub Release
+        if: steps.sync.outputs.pushed == 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKGVER: ${{ steps.sync.outputs.pkgver }}
+          PKGREL: ${{ steps.sync.outputs.pkgrel }}
+          TAG: ${{ steps.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "==> GitHub Release ${TAG} already exists; skipping."
+            exit 0
+          fi
+
+          stage_root="$(mktemp -d)"
+          trap 'rm -rf "$stage_root"' EXIT
+          bundle_dir="${stage_root}/t3-code-no-telemetry-${TAG}"
+          mkdir -p "${bundle_dir}"
+          for f in PKGBUILD .SRCINFO 0001-strip-telemetry.patch 0002-linux-build-compat.patch .gitignore LICENSE; do
+            cp "./${f}" "${bundle_dir}/${f}"
+          done
+
+          archive_name="t3-code-no-telemetry-${TAG}-aur-recipe.tar.gz"
+          tar -C "${stage_root}" -czf "${stage_root}/${archive_name}" "t3-code-no-telemetry-${TAG}"
+          cp ./PKGBUILD ./".SRCINFO" ./0001-strip-telemetry.patch ./0002-linux-build-compat.patch "${stage_root}/"
+          (
+            cd "${stage_root}"
+            sha256sum "${archive_name}" PKGBUILD .SRCINFO 0001-strip-telemetry.patch 0002-linux-build-compat.patch > SHA256SUMS.txt
+          )
+
+          notes_file="${stage_root}/release-notes.md"
+          cat > "${notes_file}" <<EOF
+          Frozen AUR recipe for **T3 Code v${PKGVER}** (de-telemetrized source build, \`pkgrel=${PKGREL}\`).
+
+          - Upstream release: https://github.com/pingdotgg/t3code/releases/tag/v${PKGVER}
+          - Reproducible historical build: pinned source tarball SHA-256, static unified \`.patch\` files, and pinned \`vite-plus\` CLI version.
+
+          ### Build & install this exact version on Arch / CachyOS
+          \`\`\`bash
+          tar -xzf ${archive_name}
+          cd t3-code-no-telemetry-${TAG}
+          makepkg -si
+          \`\`\`
+
+          ### SHA-256 checksums
+          \`\`\`text
+          $(cat "${stage_root}/SHA256SUMS.txt")
+          \`\`\`
+          EOF
+
+          gh release create "${TAG}" \
+            --target master \
+            --title "t3-code-no-telemetry ${TAG} (Upstream v${PKGVER})" \
+            --notes-file "${notes_file}" \
+            "${stage_root}/${archive_name}" \
+            "${stage_root}/PKGBUILD" \
+            "${stage_root}/.SRCINFO" \
+            "${stage_root}/0001-strip-telemetry.patch" \
+            "${stage_root}/0002-linux-build-compat.patch" \
+            "${stage_root}/SHA256SUMS.txt"
+
+      - name: Trigger downstream AUR sync (optional)
+        if: steps.sync.outputs.pushed == 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.AUR_SYNC_DISPATCH_TOKEN }}
+          TARGET_REPO: ${{ vars.AUR_SYNC_DISPATCH_REPO }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TOKEN:-}" || -z "${TARGET_REPO:-}" ]]; then
+            echo "No downstream AUR sync dispatch configured; skipped."
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${TARGET_REPO}/dispatches" \
+            -d '{"event_type":"upstream-push"}'

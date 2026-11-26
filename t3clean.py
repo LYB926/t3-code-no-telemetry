@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from t3clean import DEFAULT_REF, DEFAULT_REPO_URL  # noqa: E402
-from t3clean.aur import export_aur_package, resolve_source_sha256  # noqa: E402
+from t3clean.aur import export_aur_package  # noqa: E402
 from t3clean.builder import BuildOptions, VALID_TARGETS, build_target  # noqa: E402
 from t3clean.deployer import (  # noqa: E402
     DeployOptions,
@@ -33,7 +33,7 @@ from t3clean.patcher import (  # noqa: E402
     PatchOptions,
     patch_source_tree,
 )
-from t3clean.source import fetch_source  # noqa: E402
+from t3clean.source import fetch_source, resolve_latest_github_release  # noqa: E402
 from t3clean.verifier import VerifyOptions, verify_artifact  # noqa: E402
 
 
@@ -281,44 +281,63 @@ def _cmd_rollback_server(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_latest_release(args: argparse.Namespace) -> int:
+    as_json = _wants_json(args)
+    info = resolve_latest_github_release(repo_url=args.repo_url)
+    if as_json:
+        _emit_json({"ok": True, **info})
+    else:
+        print(f"Latest stable release: {info['tag']} ({info['html_url']})")
+    return 0
+
+
 def _cmd_export_aur(args: argparse.Namespace) -> int:
     as_json = _wants_json(args)
     out_dir = Path(args.out).expanduser().resolve()
+    source_dir = Path(args.source).expanduser().resolve() if args.source else None
     source_tarball = Path(args.source_tarball).expanduser().resolve() if args.source_tarball else None
-    resolved_sha = resolve_source_sha256(
-        args.ref,
-        source_sha256=args.source_sha256,
-        source_tarball=source_tarball,
-    )
-    created = export_aur_package(
+    result = export_aur_package(
         repo_root=REPO_ROOT,
         out_dir=out_dir,
         upstream_ref=args.ref,
         pkgrel=args.pkgrel,
-        source_sha256=resolved_sha,
+        source_dir=source_dir,
+        source_tarball=source_tarball,
+        source_sha256=args.source_sha256,
+        skip_verify=bool(args.skip_verify),
+        repo_url=args.repo_url,
     )
     if as_json:
         _emit_json(
             {
                 "ok": True,
-                "out": str(out_dir),
-                "ref": args.ref,
-                "pkgrel": args.pkgrel,
-                "source_sha256": resolved_sha,
-                "files": [str(path) for path in created],
+                "out": str(result.out_dir),
+                "ref": result.ref,
+                "resolved_ref": result.resolved_ref,
+                "pkgver": result.pkgver,
+                "pkgrel": result.pkgrel,
+                "source_archive": result.source_archive,
+                "source_url": result.source_url,
+                "source_sha256": result.source_sha256,
+                "vp_version": result.vp_version,
+                "patch_files": list(result.patch_files),
+                "verified_files": result.verified_files,
+                "audit_files": list(result.audit_files),
+                "files": [str(path) for path in result.files],
             }
         )
     else:
+        vp_desc = result.vp_version or "fallback ^1.4.0"
         print(
-            f"Exported flat AUR package (ref={args.ref}, pkgrel={args.pkgrel}, "
-            f"source_sha256={resolved_sha}) -> {out_dir}"
+            f"Exported flat AUR package (ref={result.resolved_ref}, pkgver={result.pkgver}, "
+            f"pkgrel={result.pkgrel}, vp={vp_desc}, source_sha256={result.source_sha256}) -> {result.out_dir}"
         )
-        for path in created:
+        for path in result.files:
             print(f"  - {path.name}")
-        if resolved_sha == "SKIP":
+        if result.source_sha256 == "SKIP":
             print(
-                "NOTE: Source tarball checksum is SKIP. For public AUR uploads of a pinned tag, "
-                "pass --source-sha256 <64-hex|auto> or --source-tarball <path>.",
+                "NOTE: Source tarball checksum is SKIP. Omit --source or pass "
+                "--source-sha256 <64-hex|auto> / --source-tarball <path> before publishing to AUR.",
                 file=sys.stderr,
             )
     return 0
@@ -609,20 +628,38 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json_flag(p_rollback)
     p_rollback.set_defaults(handler=_cmd_rollback_server)
 
+    # latest-release
+    p_latest = subparsers.add_parser(
+        "latest-release",
+        help="Query GitHub Releases API for the newest stable upstream T3 Code release.",
+    )
+    p_latest.add_argument(
+        "--repo-url",
+        default=DEFAULT_REPO_URL,
+        help=f"Upstream GitHub repository URL (default: {DEFAULT_REPO_URL}).",
+    )
+    _add_json_flag(p_latest)
+    p_latest.set_defaults(handler=_cmd_latest_release)
+
     # export-aur
     p_aur = subparsers.add_parser(
         "export-aur",
-        help="Export a 100%% flat, zero-subdirectory AUR package directory.",
+        help="Export a minimal, patch-based flat AUR package directory.",
     )
     p_aur.add_argument(
         "--out",
         required=True,
-        help="Output directory for flat AUR package files.",
+        help="Output directory for flat AUR package files (e.g. ./aur).",
     )
     p_aur.add_argument(
         "--ref",
         default=DEFAULT_REF,
-        help=f"Pinned upstream Git ref for PKGBUILD/.SRCINFO (default: {DEFAULT_REF}).",
+        help=f"Upstream Git ref, 'latest-release', or 'latest-stable' (default: {DEFAULT_REF}).",
+    )
+    p_aur.add_argument(
+        "--repo-url",
+        default=DEFAULT_REPO_URL,
+        help=f"Upstream GitHub repository URL (default: {DEFAULT_REPO_URL}).",
     )
     p_aur.add_argument(
         "--pkgrel",
@@ -631,20 +668,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Arch package release number (default: 1).",
     )
     p_aur.add_argument(
-        "--source-sha256",
+        "--source",
         default=None,
-        help=(
-            "SHA-256 hex digest for the upstream source tarball, 'auto' (stream-download "
-            "the archive URL and compute SHA-256), or 'SKIP' (default: SKIP)."
-        ),
+        help="Generate unified .patch files from an existing clean upstream checkout (mutually exclusive with --source-tarball).",
     )
     p_aur.add_argument(
         "--source-tarball",
         default=None,
         help=(
-            "Compute the upstream source tarball SHA-256 from an already-downloaded local "
-            ".tar.gz file (mutually exclusive with --source-sha256)."
+            "Hash and extract an already-downloaded local upstream .tar.gz archive "
+            "(zero network; mutually exclusive with --source and --source-sha256)."
         ),
+    )
+    p_aur.add_argument(
+        "--source-sha256",
+        default=None,
+        help=(
+            "Optional SHA-256 hex digest, 'auto', or 'SKIP' (mainly for --source mode; "
+            "omitting --source/--source-tarball downloads and hashes the archive automatically)."
+        ),
+    )
+    p_aur.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip full source-tree telemetry verification after applying generated patches.",
     )
     _add_json_flag(p_aur)
     p_aur.set_defaults(handler=_cmd_export_aur)

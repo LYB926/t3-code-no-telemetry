@@ -1,14 +1,15 @@
 """Deterministic, idempotent de-telemetry & build-safety source patcher for T3 Code.
 
-Applies 6 targeted de-telemetry rules plus build-compatibility guards
-(Tailwind CSS v4 source-scan exclusion and host-aware Linux glibc ceiling)
-across upstream v0.1.11, v0.1.12, and main while keeping model manifest and
-usage pricing services intact (rules 7 & 8).
+Targets the current latest stable upstream release (v0.1.12+) with strict fail-fast
+anchor checks: applies 6 de-telemetry rules plus 2 Linux build-compatibility guards
+while keeping model manifest and usage pricing services intact (rules 7 & 8).
 """
 
 from dataclasses import dataclass
+import difflib
 from pathlib import Path
 import re
+from typing import Callable
 
 from . import PATCH_MARKER
 
@@ -616,21 +617,16 @@ def _patch_analytics_service(original: str) -> tuple[str, str]:
             )
 
     masked = _ts_mask_non_code(original)
-    returns_boolean = bool(
-        re.search(
-            r"readonly\s+record\s*:[\s\S]*?=>\s*Effect\.Effect<\s*boolean\s*>",
-            masked,
+    if not re.search(
+        r"readonly\s+record\s*:[\s\S]*?=>\s*Effect\.Effect<\s*boolean\s*>",
+        masked,
+    ):
+        raise PatchAnchorNotFoundError(
+            "[analytics-service] apps/server/src/telemetry/AnalyticsService.ts: "
+            "expected AnalyticsService.record to return Effect.Effect<boolean>"
         )
-    )
-    returns_void = bool(
-        re.search(
-            r"readonly\s+record\s*:[\s\S]*?=>\s*Effect\.Effect<\s*void\s*>",
-            masked,
-        )
-    )
 
-    if returns_boolean:
-        patched = f"""{PATCH_MARKER}
+    patched = f"""{PATCH_MARKER}
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -667,57 +663,16 @@ export const make = Effect.succeed(
 
 export const layer = Layer.effect(AnalyticsService, make);
 """
-        return patched, "replaced AnalyticsService with boolean no-op stub"
-
-    if returns_void:
-        patched = f"""{PATCH_MARKER}
-import * as Context from "effect/Context";
-import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
-
-import type {{ TelemetryOwner }} from "./Identify.ts";
-
-export class AnalyticsService extends Context.Service<
-  AnalyticsService,
-  {{
-    readonly record: (
-      event: string,
-      properties?: Readonly<Record<string, unknown>>,
-    ) => Effect.Effect<void>;
-
-    readonly flush: Effect.Effect<void>;
-
-    readonly recordOwners: (
-      owners: ReadonlyArray<TelemetryOwner>,
-      observedBy: "server" | "client",
-    ) => Effect.Effect<void>;
-  }}
->()("t3/telemetry/AnalyticsService") {{}}
-
-/** @public */
-export const make = Effect.succeed(
-  AnalyticsService.of({{
-    record: () => Effect.void,
-    flush: Effect.void,
-    recordOwners: () => Effect.void,
-  }}),
-);
-
-export const layer = Layer.effect(AnalyticsService, make);
-"""
-        return patched, "replaced AnalyticsService with legacy void no-op stub"
-
-    raise PatchAnchorNotFoundError(
-        "[analytics-service] apps/server/src/telemetry/AnalyticsService.ts: "
-        "could not detect AnalyticsService.record return type (expected Effect.Effect<boolean> or Effect.Effect<void>)"
-    )
+    return patched, "replaced AnalyticsService with boolean no-op stub"
 
 
 def _patch_telemetry_identify(original: str) -> tuple[str, str]:
-    """Rule 2: Replace Identify.ts with a dynamic version-aware zero-I/O stub."""
+    """Rule 2: Replace Identify.ts with a zero-I/O stub."""
     required_anchors = (
         "export const TelemetryOwnerSource",
         "export interface TelemetryOwner",
+        "export class TelemetryAnonymousIdGenerationError",
+        "export class TelemetryAnonymousIdPersistenceError",
         "export const getTelemetryIdentity",
         "export const getServerOwners",
     )
@@ -728,76 +683,22 @@ def _patch_telemetry_identify(original: str) -> tuple[str, str]:
                 f"missing anchor {anchor!r}"
             )
 
-    has_legacy_owners = bool(
-        re.search(
-            r'export\s+const\s+TelemetryOwnerSource\s*=[^\n;]*["\']openai["\']',
-            original,
-        )
-    )
-    has_identity_source = bool(
-        re.search(r"\bexport\s+const\s+TelemetryIdentitySource\b", original)
-    )
-    has_error_source_field = bool(
-        re.search(
-            r'TelemetryAnonymousIdGenerationError[\s\S]*?source:\s*Schema\.Literal\(["\']anonymous["\']\)',
-            original,
-        )
-    )
-    has_openai_user_id = bool(
-        re.search(r"\bexport\s+(?:const|function)\s+openAiUserId\b", original)
-    )
-    has_identity_for_home = bool(
-        re.search(r"\bexport\s+(?:const|function)\s+getTelemetryIdentityForHome\b", original)
-    )
-    has_owners_for_home = bool(
-        re.search(r"\bexport\s+(?:const|function)\s+getServerOwnersForHome\b", original)
-    )
+    patched = f"""{PATCH_MARKER}
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
-    imports = [
-        'import * as Effect from "effect/Effect";',
-    ]
-    if has_openai_user_id:
-        imports.extend(
-            [
-                'import * as Base64Url from "effect/encoding/Base64Url";',
-                'import * as Option from "effect/Option";',
-                'import * as Result from "effect/Result";',
-            ]
-        )
-    imports.append('import * as Schema from "effect/Schema";')
-
-    owner_literals = (
-        '["connect", "openai", "claude", "device"]'
-        if has_legacy_owners
-        else '["connect", "device"]'
-    )
-
-    sections: list[str] = [
-        PATCH_MARKER,
-        "\n".join(imports),
-        f"""export const TelemetryOwnerSource = Schema.Literals({owner_literals});
+export const TelemetryOwnerSource = Schema.Literals(["connect", "device"]);
 export type TelemetryOwnerSource = typeof TelemetryOwnerSource.Type;
 
 export interface TelemetryOwner {{
   readonly source: TelemetryOwnerSource;
   readonly ownerId: string;
-}}""",
-    ]
+}}
 
-    if has_identity_source:
-        sections.append(
-            """export const TelemetryIdentitySource = Schema.Literals(["codex", "claude", "anonymous"]);
-export type TelemetryIdentitySource = typeof TelemetryIdentitySource.Type;"""
-        )
-
-    error_source_line = (
-        '    source: Schema.Literal("anonymous"),\n' if has_error_source_field else ""
-    )
-    sections.append(
-        f"""export class TelemetryAnonymousIdGenerationError extends Schema.TaggedError<TelemetryAnonymousIdGenerationError>()(
+export class TelemetryAnonymousIdGenerationError extends Schema.TaggedError<TelemetryAnonymousIdGenerationError>()(
   "TelemetryAnonymousIdGenerationError",
   {{
-{error_source_line}    filePath: Schema.String,
+    filePath: Schema.String,
     cause: Schema.Defect(),
   }},
 ) {{
@@ -809,58 +710,23 @@ export type TelemetryIdentitySource = typeof TelemetryIdentitySource.Type;"""
 export class TelemetryAnonymousIdPersistenceError extends Schema.TaggedError<TelemetryAnonymousIdPersistenceError>()(
   "TelemetryAnonymousIdPersistenceError",
   {{
-{error_source_line}    filePath: Schema.String,
+    filePath: Schema.String,
     cause: Schema.Defect(),
   }},
 ) {{
   override get message(): string {{
     return `Failed to persist anonymous telemetry identity at '${{this.filePath}}'.`;
   }}
-}}"""
-    )
+}}
 
-    if has_openai_user_id:
-        sections.append(
-            """const IdTokenClaims = Schema.Struct({
-  "https://api.openai.com/auth": Schema.Struct({ user_id: Schema.NonEmptyString }),
-});
-const decodeIdTokenClaims = Schema.decodeUnknownOption(Schema.fromJsonString(IdTokenClaims));
-
-export const openAiUserId = (idToken: string): Option.Option<string> => {
-  const payload = Base64Url.decodeString(idToken.split(".")[1] ?? "");
-  return Result.isSuccess(payload)
-    ? Option.map(
-        decodeIdTokenClaims(payload.success),
-        (claims) => claims["https://api.openai.com/auth"].user_id,
-      )
-    : Option.none<string>();
-};"""
-        )
-
-    sections.append(
-        """export const getTelemetryIdentity = Effect.succeed({
+export const getTelemetryIdentity = Effect.succeed({{
   distinctId: null as string | null,
   installId: null as string | null,
-});"""
-    )
+}});
 
-    if has_identity_for_home:
-        sections.append(
-            "export const getTelemetryIdentityForHome = (_homeDirectory: string) => getTelemetryIdentity;"
-        )
-
-    sections.append(
-        "export const getServerOwners = Effect.succeed([] as ReadonlyArray<TelemetryOwner>);"
-    )
-
-    if has_owners_for_home:
-        sections.append(
-            "export const getServerOwnersForHome = (_homeDirectory: string) => getServerOwners;"
-        )
-
-    patched = "\n\n".join(sections) + "\n"
-    variant = "legacy v0.1.11-compatible" if (has_openai_user_id or has_identity_source) else "modern"
-    return patched, f"replaced Identify.ts with {variant} zero-I/O stub"
+export const getServerOwners = Effect.succeed([] as ReadonlyArray<TelemetryOwner>);
+"""
+    return patched, "replaced Identify.ts with zero-I/O stub"
 
 
 def _patch_web_connection_platform(original: str) -> tuple[str, str]:
@@ -1030,20 +896,13 @@ def _patch_server_cloud_public_config(original: str) -> tuple[str, str]:
     return _patch_prepend_marker(updated), "hard-locked server cloud and relay tracing config off"
 
 
-def patch_source_tree(
-    source_dir: Path,
-    options: PatchOptions | None = None,
-) -> list[FilePatchResult]:
-    """Apply all enabled de-telemetry patch rules to an upstream T3 Code checkout.
+_BUILD_COMPAT_RULES = frozenset({"tailwind-source-ignore", "linux-glibc-ceiling"})
 
-    The operation is strictly idempotent using ``PATCH_MARKER`` and fails fast
-    with ``PatchAnchorNotFoundError`` if any required target file or semantic
-    anchor is missing or structurally invalid.
-    """
-    opts = options if options is not None else PatchOptions()
-    root = Path(source_dir)
+_PatchPlanEntry = tuple[str, str, Callable[[str], tuple[str, str]]]
 
-    plan: list[tuple[str, str, object]] = [
+
+def _build_patch_plan(opts: PatchOptions) -> list[_PatchPlanEntry]:
+    plan: list[_PatchPlanEntry] = [
         (
             "analytics-service",
             "apps/server/src/telemetry/AnalyticsService.ts",
@@ -1074,17 +933,12 @@ def patch_source_tree(
             "apps/web/src/index.css",
             _patch_web_tailwind_source_ignore,
         ),
+        (
+            "linux-glibc-ceiling",
+            "scripts/linux-glibc.ts",
+            _patch_linux_glibc_ceiling,
+        ),
     ]
-
-    # Present in v0.1.12+/main; gracefully skipped on older tags (e.g. v0.1.11) without the file.
-    if (root / "scripts/linux-glibc.ts").is_file():
-        plan.append(
-            (
-                "linux-glibc-ceiling",
-                "scripts/linux-glibc.ts",
-                _patch_linux_glibc_ceiling,
-            )
-        )
 
     if not opts.keep_updater:
         plan.append(
@@ -1111,6 +965,91 @@ def patch_source_tree(
             ]
         )
 
+    return plan
+
+
+def _format_unified_diff(rel_path: str, original: str, patched: str) -> str:
+    """Render a deterministic GNU-patch/git-apply-compatible unified diff for one file."""
+    orig_lines = original.splitlines(keepends=True)
+    new_lines = patched.splitlines(keepends=True)
+    diff_lines = list(
+        difflib.unified_diff(
+            orig_lines,
+            new_lines,
+            fromfile=f"a/{rel_path}",
+            tofile=f"b/{rel_path}",
+            lineterm="\n",
+        )
+    )
+    if not diff_lines:
+        return ""
+
+    rendered: list[str] = [f"diff --git a/{rel_path} b/{rel_path}\n"]
+    for line in diff_lines:
+        if line.endswith("\n"):
+            rendered.append(line)
+        else:
+            rendered.append(line + "\n\\ No newline at end of file\n")
+    return "".join(rendered)
+
+
+def generate_patch_series(
+    source_dir: Path,
+    options: PatchOptions | None = None,
+) -> dict[str, str]:
+    """Compute standard unified ``.patch`` files without mutating ``source_dir``.
+
+    Returns an ordered mapping with two deterministic patch series files:
+    - ``0001-strip-telemetry.patch``: the 6 de-telemetry / cloud / updater rules
+    - ``0002-linux-build-compat.patch``: Tailwind v4 scan guard & Linux glibc ceiling
+    """
+    opts = options if options is not None else PatchOptions()
+    root = Path(source_dir)
+    plan = _build_patch_plan(opts)
+
+    telemetry_chunks: list[str] = []
+    compat_chunks: list[str] = []
+
+    for rule_id, rel_path, transform in plan:
+        file_path = root / rel_path
+        if not file_path.is_file():
+            raise PatchAnchorNotFoundError(
+                f"[{rule_id}] {rel_path}: target file not found in {root}"
+            )
+        original = file_path.read_text(encoding="utf-8")
+        if _patch_is_already_patched(original):
+            raise ValueError(
+                f"Source tree appears already patched ({rel_path}); pass a clean upstream tree to generate patches."
+            )
+        patched, _ = transform(original)
+        chunk = _format_unified_diff(rel_path, original, patched)
+        if not chunk:
+            continue
+        if rule_id in _BUILD_COMPAT_RULES:
+            compat_chunks.append(chunk)
+        else:
+            telemetry_chunks.append(chunk)
+
+    return {
+        "0001-strip-telemetry.patch": "".join(telemetry_chunks),
+        "0002-linux-build-compat.patch": "".join(compat_chunks),
+    }
+
+
+def patch_source_tree(
+    source_dir: Path,
+    options: PatchOptions | None = None,
+) -> list[FilePatchResult]:
+    """Apply all enabled de-telemetry patch rules to an upstream T3 Code checkout.
+
+    The operation is strictly idempotent using ``PATCH_MARKER`` and fails fast
+    with ``PatchAnchorNotFoundError`` if any required target file or semantic
+    anchor is missing or structurally invalid.
+    """
+    opts = options if options is not None else PatchOptions()
+    root = Path(source_dir)
+    plan = _build_patch_plan(opts)
+
     results: list[FilePatchResult] = []
     staged_writes: list[tuple[Path, str]] = []
 
@@ -1134,7 +1073,7 @@ def patch_source_tree(
             )
             continue
 
-        patched, summary = transform(original)  # type: ignore[operator]
+        patched, summary = transform(original)
         if not opts.dry_run:
             staged_writes.append((file_path, patched))
         else:

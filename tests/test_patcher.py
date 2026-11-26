@@ -1,6 +1,7 @@
-"""Unit tests for t3clean.patcher across v0.1.11, v0.1.12/main, and TS parser edge cases."""
+"""Unit tests for t3clean.patcher (latest stable v0.1.12+, patch generation, and TS parser edge cases)."""
 
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -13,6 +14,7 @@ from t3clean.patcher import (
     _ts_mask_non_code,
     _ts_replace_const_declaration,
     _ts_replace_function_body,
+    generate_patch_series,
     patch_source_tree,
 )
 from t3clean.verifier import VerifyOptions, verify_artifact
@@ -615,33 +617,57 @@ class TestPatchSourceTree(unittest.TestCase):
             self.assertEqual(len(second_results), 10)
             self.assertTrue(all((not r.changed) and r.already_patched for r in second_results))
 
-    def test_patch_v0111_tree_preserves_legacy_exports(self) -> None:
+    def test_legacy_v0111_signatures_fail_fast(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_mock_tree(root, legacy_v0111=True)
+            with self.assertRaises(PatchAnchorNotFoundError):
+                patch_source_tree(root)
 
-            results = patch_source_tree(root)
-            self.assertEqual(len(results), 9)
-            self.assertTrue(all(r.changed for r in results))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_mock_tree(root, legacy_v0111=False)
+            (root / "scripts/linux-glibc.ts").unlink()
+            with self.assertRaises(PatchAnchorNotFoundError):
+                patch_source_tree(root)
 
-            analytics = (root / "apps/server/src/telemetry/AnalyticsService.ts").read_text(
+    def test_generate_patch_series_and_gnu_patch_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            _write_mock_tree(src, legacy_v0111=False)
+            analytics_before = (src / "apps/server/src/telemetry/AnalyticsService.ts").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("Effect.Effect<void>", analytics)
-            self.assertIn("record: () => Effect.void", analytics)
-            self.assertNotIn("Effect.Effect<boolean>", analytics)
 
-            identify = (root / "apps/server/src/telemetry/Identify.ts").read_text(encoding="utf-8")
-            self.assertIn('Schema.Literals(["connect", "openai", "claude", "device"])', identify)
-            self.assertIn("export const TelemetryIdentitySource", identify)
-            self.assertIn("export const openAiUserId", identify)
-            self.assertIn("export const getTelemetryIdentityForHome", identify)
-            self.assertIn("export const getServerOwnersForHome", identify)
-            self.assertIn('source: Schema.Literal("anonymous")', identify)
-            for forbidden in (".codex", "auth.json", ".claude.json", "anonymousIdPath", "ServerSecretStore"):
-                self.assertNotIn(forbidden, identify)
+            patches = generate_patch_series(src)
+            self.assertEqual(
+                list(patches.keys()),
+                ["0001-strip-telemetry.patch", "0002-linux-build-compat.patch"],
+            )
+            # Source tree must remain untouched when generating patches.
+            self.assertEqual(
+                (src / "apps/server/src/telemetry/AnalyticsService.ts").read_text(encoding="utf-8"),
+                analytics_before,
+            )
+            self.assertIn("apps/server/src/telemetry/AnalyticsService.ts", patches["0001-strip-telemetry.patch"])
+            self.assertNotIn("scripts/linux-glibc.ts", patches["0001-strip-telemetry.patch"])
+            self.assertIn("apps/web/src/index.css", patches["0002-linux-build-compat.patch"])
+            self.assertIn("scripts/linux-glibc.ts", patches["0002-linux-build-compat.patch"])
 
-            post_report = verify_artifact(root)
+            for name, content in patches.items():
+                patch_file = root / name
+                patch_file.write_text(content, encoding="utf-8")
+                proc = subprocess.run(
+                    ["patch", "--batch", "--forward", "-Np1", "-i", str(patch_file)],
+                    cwd=str(src),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+            post_report = verify_artifact(src)
             self.assertTrue(post_report.ok, f"Unexpected findings: {post_report.findings}")
 
     def test_keep_updater_and_keep_cloud_skip_optional_rules(self) -> None:

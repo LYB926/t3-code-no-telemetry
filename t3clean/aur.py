@@ -1,25 +1,36 @@
-"""Flat AUR package exporter for t3-code-no-telemetry.
+"""Minimal, patch-based flat AUR package exporter for t3-code-no-telemetry.
 
-Generates a 100% flat, zero-subdirectory directory ready to push directly to AUR:
-- t3clean-standalone.py (programmatically combined from __init__.py, patcher.py, verifier.py)
-- PKGBUILD (self-contained, zero ../../ references, real sha256sums)
-- .SRCINFO (exact match for PKGBUILD metadata & checksums)
-- t3-code-no-telemetry.sh
-- t3-code-no-telemetry.desktop
+Generates a clean, auditable flat AUR directory ready to sync to an orphan
+``master`` branch and push directly to AUR:
+- PKGBUILD (self-contained, standard ``patch -Np1``, inline launcher/.desktop/check)
+- .SRCINFO (exact match for ``makepkg --printsrcinfo``)
+- 0001-strip-telemetry.patch (unified diff of the 6 de-telemetry/cloud/updater rules)
+- 0002-linux-build-compat.patch (Tailwind v4 scan guard & Linux glibc ceiling)
+- .gitignore (ignores local makepkg build artifacts)
 """
 
 from __future__ import annotations
 
-import ast
+from dataclasses import dataclass
 import hashlib
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import re
 import shutil
-import stat
+import subprocess
+import tarfile
+import tempfile
 import urllib.error
 import urllib.request
 
 from . import DEFAULT_REF, DEFAULT_REPO_URL
+from .patcher import PatchOptions, generate_patch_series
+from .source import (
+    read_required_vp_version,
+    resolve_latest_github_release,
+    resolve_latest_stable_tag,
+)
+from .verifier import VerifyOptions, verify_artifact
 
 PKGNAME = "t3-code-no-telemetry"
 PKGDESC = (
@@ -27,6 +38,7 @@ PKGDESC = (
     "device tracking, and cloud auth stripped"
 )
 UPSTREAM_URL = "https://github.com/pingdotgg/t3code"
+MAINTAINER = "Ke Zhang <zhangke23 at m dot fudan dot edu dot cn>"
 
 ARCH_DEPENDS: tuple[str, ...] = (
     "alsa-lib",
@@ -78,190 +90,26 @@ ARCH_OPTDEPENDS: tuple[str, ...] = (
 
 ARCH_OPTIONS: tuple[str, ...] = ("!strip", "!debug")
 
-_STANDALONE_CLI_FOOTER = '''
+AUR_GITIGNORE_CONTENT = """\
+*.pkg.tar.*
+*.tar.gz
+*.tar.xz
+*.tar.zst
+pkg/
+src/
+"""
 
-# --- BEGIN standalone CLI ---
-def _standalone_main(argv: list[str] | None = None) -> int:
-    import argparse
-    from dataclasses import asdict
-    import json
-    import sys
-
-    parser = argparse.ArgumentParser(
-        prog="t3clean-standalone.py",
-        description="Standalone de-telemetry patcher and verifier for T3 Code AUR builds.",
-    )
-    parser.add_argument("--json", action="store_true", default=False, help="Emit JSON output.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    p_patch = subparsers.add_parser("patch", help="Apply idempotent de-telemetry patches.")
-    p_patch.add_argument("--source", required=True, help="Path to T3 Code source tree.")
-    p_patch.add_argument("--dry-run", action="store_true", help="Report changes without writing.")
-    p_patch.add_argument("--keep-updater", action="store_true", help="Keep desktop updater enabled.")
-    p_patch.add_argument("--keep-cloud", action="store_true", help="Keep cloud config hooks.")
-    p_patch.add_argument("--json", dest="json_sub", action="store_true", default=False)
-
-    p_verify = subparsers.add_parser("verify", help="Verify artifact or source tree has no telemetry.")
-    p_verify.add_argument("--artifact", required=True, help="Path to file or directory to scan.")
-    p_verify.add_argument("--keep-updater", action="store_true", help="Allow app-update.yml.")
-    p_verify.add_argument(
-        "--strict-offline",
-        action="store_true",
-        help="Also flag GitHub raw manifest URLs.",
-    )
-    p_verify.add_argument("--json", dest="json_sub", action="store_true", default=False)
-
-    args = parser.parse_args(argv)
-    as_json = bool(args.json or getattr(args, "json_sub", False))
-
-    try:
-        if args.command == "patch":
-            source_dir = Path(args.source).expanduser().resolve()
-            options = PatchOptions(
-                keep_updater=bool(args.keep_updater),
-                keep_cloud=bool(args.keep_cloud),
-                dry_run=bool(args.dry_run),
-            )
-            results = patch_source_tree(source_dir, options)
-            if as_json:
-                print(
-                    json.dumps(
-                        {
-                            "ok": True,
-                            "source": str(source_dir),
-                            "dry_run": options.dry_run,
-                            "results": [asdict(r) for r in results],
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-            else:
-                for item in results:
-                    tag = (
-                        "ALREADY"
-                        if (item.already_patched and not item.changed)
-                        else ("DRY-RUN" if (item.changed and options.dry_run) else ("PATCHED" if item.changed else "SKIPPED"))
-                    )
-                    print(f"[{tag:7s}] {item.rule_id}: {item.relative_path} — {item.summary}")
-            return 0
-
-        if args.command == "verify":
-            target_path = Path(args.artifact).expanduser().resolve()
-            options = VerifyOptions(
-                keep_updater=bool(args.keep_updater),
-                strict_offline=bool(args.strict_offline),
-            )
-            report = verify_artifact(target_path, options)
-            if as_json:
-                print(
-                    json.dumps(
-                        {
-                            "ok": report.ok,
-                            "artifact": str(target_path),
-                            "scanned_files": report.scanned_files,
-                            "findings": [asdict(f) for f in report.findings],
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-            elif report.ok:
-                print(f"OK: verified {report.scanned_files} file(s) with 0 findings.")
-            else:
-                print(
-                    f"FAILED: {len(report.findings)} finding(s) across {report.scanned_files} file(s):",
-                    file=sys.stderr,
-                )
-                for finding in report.findings:
-                    print(f"  - [{finding.rule}] {finding.path}: {finding.detail}", file=sys.stderr)
-            return 0 if report.ok else 1
-    except PatchAnchorNotFoundError as exc:
-        if as_json:
-            print(json.dumps({"ok": False, "error": f"Patch anchor missing: {exc}"}))
-        else:
-            print(f"ERROR: Patch anchor missing: {exc}", file=sys.stderr)
-        return 1
-    except (RuntimeError, OSError, ValueError) as exc:
-        if as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}))
-        else:
-            print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(_standalone_main())
-'''
-
+_OBSOLETE_AUR_FILES: tuple[str, ...] = (
+    "t3clean-standalone.py",
+    "t3-code-no-telemetry.sh",
+    "t3-code-no-telemetry.desktop",
+)
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_AUDIT_SKIP_DIRS = frozenset({".git", ".repos", "node_modules", "dist", "target", "__pycache__"})
+_TEST_FILE_SUFFIXES = (".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx")
 
-_AUR_VP_HELPERS = r'''_t3clean_required_vp_version() {
-  local _src_dir="${1:-.}"
-  python3 - "${_src_dir}" <<'PY' 2>/dev/null || true
-import json, pathlib, re, sys
-
-src = pathlib.Path(sys.argv[1])
-ver_re = re.compile(r"^(?:>=|<=|>|<|=|\^|~|\s)*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
-key_re = re.compile(r"""^(?:"vite-plus"|'vite-plus'|vite-plus)\s*:\s*(.+?)\s*$""")
-
-ws = src / "pnpm-workspace.yaml"
-if ws.is_file():
-    in_catalog = False
-    cat_indent = None
-    for raw in ws.read_text(encoding="utf-8", errors="ignore").splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(raw) - len(raw.lstrip(" \t"))
-        if indent == 0:
-            in_catalog = bool(re.match(r"^catalog\s*:\s*(?:#.*)?$", stripped))
-            cat_indent = None
-            continue
-        if not in_catalog:
-            continue
-        if cat_indent is None:
-            cat_indent = indent
-        if indent != cat_indent:
-            continue
-        m = key_re.match(stripped)
-        if not m:
-            continue
-        val = m.group(1)
-        if val.startswith('"'):
-            qm = re.match(r'^"([^"]+)"(?:\s*#.*)?$', val)
-            val = qm.group(1) if qm else ""
-        elif val.startswith("'"):
-            qm = re.match(r"^'([^']+)'(?:\s*#.*)?$", val)
-            val = qm.group(1) if qm else ""
-        else:
-            val = val.split("#", 1)[0].strip()
-        vm = ver_re.match(val.strip())
-        if vm:
-            print(vm.group(1))
-            sys.exit(0)
-
-pkg = src / "package.json"
-if pkg.is_file():
-    try:
-        data = json.loads(pkg.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
-    if isinstance(data, dict):
-        for sec in ("devDependencies", "dependencies", "optionalDependencies"):
-            deps = data.get(sec)
-            if isinstance(deps, dict) and isinstance(deps.get("vite-plus"), str):
-                vm = ver_re.match(deps["vite-plus"].strip())
-                if vm:
-                    print(vm.group(1))
-                    sys.exit(0)
-PY
-}
-
-_t3clean_vp_ok() {
+_AUR_VP_HELPERS = r'''_t3clean_vp_ok() {
   local _vp_bin="$1"
   local _req_ver="${2:-}"
   [[ -x "${_vp_bin}" ]] || return 1
@@ -282,13 +130,10 @@ sys.exit(0 if (found[0] == 1 and found >= (1, 4, 0)) else 1)' "${_ver}" "${_req_
 }
 
 _t3clean_ensure_vp() {
-  local _src_dir="${1:-.}"
-  local _req_vp _vp_spec
-  _req_vp="$(_t3clean_required_vp_version "${_src_dir}")"
+  local _req_vp="${_vp_version:-}"
+  local _vp_spec="vite-plus@^1.4.0"
   if [[ -n "${_req_vp}" ]]; then
     _vp_spec="vite-plus@${_req_vp}"
-  else
-    _vp_spec="vite-plus@^1.4.0"
   fi
 
   local _sys_vp
@@ -323,13 +168,108 @@ _t3clean_ensure_vp() {
   export PATH="${_vp_prefix}/bin:${PATH}"
 }'''
 
+_AUR_CHECK_SCANNER = r'''  python3 - "${_artifact_dir}" <<'PY'
+import os, pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+literals = (
+    ("posthog-ingest-host", b"ingest.t3.codes"),
+    ("posthog-api-key", b"phc_XOWci4oZP4VvLiEyrFqkFjP4CZn55mjYYBMREK5Wd6m"),
+    ("axiom-dataset-header", b"X-Axiom-Dataset"),
+    ("posthog-key-env", b"T3CODE_POSTHOG_KEY"),
+    ("posthog-host-env", b"T3CODE_POSTHOG_HOST"),
+    ("analytics-device-id", b"t3code:analytics-device-id"),
+)
+clerk_re = re.compile(rb"pk_(?:live|test)_[A-Za-z0-9_-]{12,}")
+text_exts = {".js", ".mjs", ".cjs", ".json", ".yml", ".yaml", ".html", ".txt"}
+findings = []
+scanned = 0
+
+def scan_bytes(path, rel):
+    tail = b""
+    hit_rules = set()
+    with path.open("rb") as fh:
+        while chunk := fh.read(1024 * 1024):
+            win = tail + chunk
+            for rule, needle in literals:
+                if rule not in hit_rules and needle in win:
+                    hit_rules.add(rule)
+                    findings.append((rel, rule, needle.decode("utf-8", "replace")))
+            if "clerk-publishable-key" not in hit_rules:
+                m = clerk_re.search(win)
+                if m:
+                    hit_rules.add("clerk-publishable-key")
+                    findings.append((rel, "clerk-publishable-key", m.group(0).decode("utf-8", "replace")))
+            tail = win[-4096:]
+
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames.sort()
+    for name in sorted(filenames):
+        p = pathlib.Path(dirpath) / name
+        if p.is_symlink() or not p.is_file():
+            continue
+        lower = name.lower()
+        rel = p.relative_to(root).as_posix()
+        if lower == "app-update.yml":
+            findings.append((rel, "app-update-yml", "forbidden auto-updater metadata present"))
+            continue
+        if lower.endswith(".map"):
+            continue
+        if p.suffix.lower() in text_exts or p.suffix.lower() == ".asar":
+            scanned += 1
+            scan_bytes(p, rel)
+
+if findings:
+    print(f"FAILED: {len(findings)} forbidden telemetry/cloud indicator(s) across {scanned} file(s):", file=sys.stderr)
+    for rel, rule, detail in findings:
+        print(f"  - [{rule}] {rel}: {detail}", file=sys.stderr)
+    sys.exit(1)
+print(f"OK: verified {scanned} file(s) under {root} with 0 telemetry findings.")
+PY'''
+
+
+@dataclass(frozen=True)
+class AurExportResult:
+    """Structured summary returned by :func:`export_aur_package`."""
+
+    out_dir: Path
+    ref: str
+    resolved_ref: str
+    pkgver: str
+    pkgrel: int
+    source_archive: str
+    source_url: str
+    source_sha256: str
+    vp_version: str | None
+    patch_files: tuple[str, ...]
+    verified_files: int
+    audit_files: tuple[str, ...]
+    files: tuple[Path, ...]
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    return digest.hexdigest().lower()
+
+
+def _download_to_file(url: str, dest: Path) -> None:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"{PKGNAME}/t3clean"},
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response, tmp_path.open("wb") as handle:
+            shutil.copyfileobj(response, handle, length=1024 * 1024)
+        os.replace(tmp_path, dest)
+    except (urllib.error.URLError, OSError) as exc:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise RuntimeError(f"Failed to download {url}: {exc}") from exc
 
 
 def _sha256_url(url: str) -> str:
@@ -348,19 +288,107 @@ def _sha256_url(url: str) -> str:
     return digest.hexdigest().lower()
 
 
+def _safe_extract_tar_to(archive_path: Path, dest_dir: Path) -> None:
+    """Safely extract a tar archive into ``dest_dir``, blocking path traversal and unsafe links."""
+    dest_root = dest_dir.resolve()
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:*") as tar:
+        members = tar.getmembers()
+        for member in members:
+            member_path = PurePosixPath(member.name)
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise ValueError(f"Unsafe tar member path: {member.name!r}")
+            if member.isdev():
+                raise ValueError(f"Refusing to extract special device member: {member.name!r}")
+            resolved_target = (dest_root / member.name).resolve()
+            try:
+                resolved_target.relative_to(dest_root)
+            except ValueError as exc:
+                raise ValueError(f"Tar member escapes destination: {member.name!r}") from exc
+            if member.issym():
+                link_path = PurePosixPath(member.linkname)
+                if link_path.is_absolute():
+                    raise ValueError(
+                        f"Refusing absolute symlink in tar: {member.name!r} -> {member.linkname!r}"
+                    )
+                resolved_link = (resolved_target.parent / member.linkname).resolve()
+                try:
+                    resolved_link.relative_to(dest_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Tar symlink escapes destination: {member.name!r} -> {member.linkname!r}"
+                    ) from exc
+            elif member.islnk():
+                link_path = PurePosixPath(member.linkname)
+                if link_path.is_absolute() or ".." in link_path.parts:
+                    raise ValueError(
+                        f"Refusing unsafe hardlink in tar: {member.name!r} -> {member.linkname!r}"
+                    )
+                resolved_link = (dest_root / member.linkname).resolve()
+                try:
+                    resolved_link.relative_to(dest_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Tar hardlink escapes destination: {member.name!r} -> {member.linkname!r}"
+                    ) from exc
+
+        if hasattr(tarfile, "tar_filter"):
+            tar.extractall(dest_root, members=members, filter="tar")
+        else:
+            tar.extractall(dest_root, members=members)
+
+
+def _locate_extracted_source_root(extract_dir: Path) -> Path:
+    if (extract_dir / "package.json").is_file():
+        return extract_dir
+    subdirs = sorted(p for p in extract_dir.iterdir() if p.is_dir())
+    for subdir in subdirs:
+        if (subdir / "package.json").is_file():
+            return subdir
+    if len(subdirs) == 1:
+        return subdirs[0]
+    raise FileNotFoundError(f"Could not locate extracted T3 Code source root under {extract_dir}")
+
+
+def _github_archive_source(ref: str, repo_url: str = DEFAULT_REPO_URL) -> tuple[str, str]:
+    """Return ``(archive_filename, archive_url)`` for a GitHub tag, commit, or branch."""
+    cleaned = ref.strip()
+    repo_base = repo_url[:-4] if repo_url.endswith(".git") else repo_url
+    safe_ref = cleaned.replace("/", "-")
+    archive_name = f"t3code-{safe_ref}.tar.gz"
+    if re.match(r"^v[0-9]", cleaned):
+        return archive_name, f"{repo_base}/archive/refs/tags/{cleaned}.tar.gz"
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", cleaned):
+        return archive_name, f"{repo_base}/archive/{cleaned}.tar.gz"
+    return archive_name, f"{repo_base}/archive/refs/heads/{cleaned}.tar.gz"
+
+
+def resolve_upstream_ref(ref: str, *, repo_url: str = DEFAULT_REPO_URL) -> str:
+    """Resolve symbolic refs (``latest-release``, ``latest-stable``) to a concrete Git ref."""
+    cleaned = ref.strip()
+    if not cleaned:
+        raise ValueError("upstream_ref must be a non-empty Git ref")
+    if cleaned == "latest-release":
+        return resolve_latest_github_release(repo_url)["tag"]
+    if cleaned == "latest-stable":
+        return resolve_latest_stable_tag(repo_url)
+    return cleaned
+
+
 def resolve_source_sha256(
     upstream_ref: str,
     *,
     source_sha256: str | None = None,
     source_tarball: Path | None = None,
+    repo_url: str = DEFAULT_REPO_URL,
 ) -> str:
     """Resolve the upstream tarball SHA-256 checksum for ``PKGBUILD`` and ``.SRCINFO``.
 
     Accepts:
     - ``source_tarball``: computes SHA-256 from an already-downloaded local archive file.
-    - ``source_sha256="auto"``: streams the GitHub archive URL for ``upstream_ref`` to compute SHA-256.
+    - ``source_sha256="auto"``: streams the GitHub archive URL for ``upstream_ref``.
     - ``source_sha256="<64-hex>"``: validates and normalizes an explicit SHA-256 hex digest.
-    - ``source_sha256="SKIP"`` or ``None``: emits ``"SKIP"``.
+    - ``source_sha256="SKIP"`` or ``None``: returns ``"SKIP"``.
     """
     if source_sha256 is not None and source_tarball is not None:
         raise ValueError("Cannot specify both source_sha256 and source_tarball; choose one.")
@@ -382,7 +410,7 @@ def resolve_source_sha256(
     if cleaned.upper() == "SKIP":
         return "SKIP"
     if cleaned.lower() == "auto":
-        _, archive_url = _github_archive_source(upstream_ref)
+        _, archive_url = _github_archive_source(upstream_ref, repo_url=repo_url)
         return _sha256_url(archive_url)
     if _SHA256_HEX_RE.fullmatch(cleaned):
         return cleaned.lower()
@@ -390,114 +418,6 @@ def resolve_source_sha256(
     raise ValueError(
         f"Invalid source_sha256 {source_sha256!r}: expected 64 hex characters, 'auto', or 'SKIP'."
     )
-
-
-def _strip_module_for_bundle(source: str, label: str) -> tuple[set[str], str]:
-    """Strip __future__ imports, relative/package imports, __all__, and __main__ blocks."""
-    tree = ast.parse(source, filename=label)
-    lines = source.splitlines(keepends=True)
-    future_features: set[str] = set()
-    remove_ranges: list[tuple[int, int]] = []
-
-    for idx, node in enumerate(tree.body):
-        # Remove top-level module docstring so the bundled script stays tidy.
-        if (
-            idx == 0
-            and isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-            and node.end_lineno is not None
-        ):
-            remove_ranges.append((node.lineno, node.end_lineno))
-            continue
-
-        if isinstance(node, ast.ImportFrom) and node.end_lineno is not None:
-            if node.module == "__future__":
-                for alias in node.names:
-                    future_features.add(alias.name)
-                remove_ranges.append((node.lineno, node.end_lineno))
-                continue
-            if node.level > 0 or node.module == "t3clean" or (node.module or "").startswith("t3clean."):
-                remove_ranges.append((node.lineno, node.end_lineno))
-                continue
-
-        if isinstance(node, ast.Import) and node.end_lineno is not None:
-            if all(alias.name == "t3clean" or alias.name.startswith("t3clean.") for alias in node.names):
-                remove_ranges.append((node.lineno, node.end_lineno))
-                continue
-
-        if isinstance(node, ast.Assign) and node.end_lineno is not None:
-            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "__all__":
-                remove_ranges.append((node.lineno, node.end_lineno))
-                continue
-
-        if isinstance(node, ast.If) and node.end_lineno is not None:
-            test = node.test
-            if (
-                isinstance(test, ast.Compare)
-                and isinstance(test.left, ast.Name)
-                and test.left.id == "__name__"
-            ):
-                remove_ranges.append((node.lineno, node.end_lineno))
-
-    skip_lines: set[int] = set()
-    for start, end in remove_ranges:
-        for line_no in range(start, end + 1):
-            skip_lines.add(line_no)
-
-    kept = [line for line_no, line in enumerate(lines, start=1) if line_no not in skip_lines]
-    body = "".join(kept).strip()
-    return future_features, body
-
-
-def _build_standalone_script(repo_root: Path) -> str:
-    """Programmatically combine __init__.py, patcher.py, and verifier.py into one CLI."""
-    pkg_dir = repo_root / "t3clean"
-    parts = [
-        ("t3clean/__init__.py", pkg_dir / "__init__.py"),
-        ("t3clean/patcher.py", pkg_dir / "patcher.py"),
-        ("t3clean/verifier.py", pkg_dir / "verifier.py"),
-    ]
-    missing = [str(path) for _, path in parts if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"Required source module(s) missing for AUR export: {', '.join(missing)}")
-
-    all_futures: set[str] = {"annotations"}
-    sections: list[str] = []
-    for label, path in parts:
-        futures, cleaned = _strip_module_for_bundle(path.read_text(encoding="utf-8"), label)
-        all_futures.update(futures)
-        sections.append(f"# --- BEGIN {label} ---\n{cleaned}\n# --- END {label} ---")
-
-    future_block = "\n".join(f"from __future__ import {feat}" for feat in sorted(all_futures))
-    header = (
-        "#!/usr/bin/env python3\n"
-        '"""Auto-generated standalone de-telemetry patcher & verifier for AUR builds.\n'
-        "\n"
-        "Combined from t3clean/__init__.py, t3clean/patcher.py, and t3clean/verifier.py.\n"
-        'Pure Python 3.10+ standard library only.\n'
-        '"""\n\n'
-        f"{future_block}\n\n"
-        "from pathlib import Path\n"
-    )
-    combined = header + "\n\n".join(sections) + "\n" + _STANDALONE_CLI_FOOTER.lstrip("\n")
-
-    # Validate syntax before emitting.
-    compile(combined, "t3clean-standalone.py", "exec")
-    return combined
-
-
-def _github_archive_source(ref: str) -> tuple[str, str]:
-    """Return ``(archive_filename, archive_url)`` for a GitHub tag, commit, or branch."""
-    cleaned = ref.strip()
-    repo_base = DEFAULT_REPO_URL[:-4] if DEFAULT_REPO_URL.endswith(".git") else DEFAULT_REPO_URL
-    safe_ref = cleaned.replace("/", "-")
-    archive_name = f"t3code-{safe_ref}.tar.gz"
-    if re.match(r"^v[0-9]", cleaned):
-        return archive_name, f"{repo_base}/archive/refs/tags/{cleaned}.tar.gz"
-    if re.fullmatch(r"[0-9a-fA-F]{7,40}", cleaned):
-        return archive_name, f"{repo_base}/archive/{cleaned}.tar.gz"
-    return archive_name, f"{repo_base}/archive/refs/heads/{cleaned}.tar.gz"
 
 
 def _pkgver_for_ref(ref: str) -> str:
@@ -516,17 +436,64 @@ def _format_bash_array(name: str, items: tuple[str, ...] | list[str]) -> str:
     return f"{name}=(\n{rendered}\n)"
 
 
+def _collect_audit_files(source_dir: Path) -> tuple[str, ...]:
+    """List upstream non-test files under ``telemetry/`` or ``cloud/`` dirs for PR review."""
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(source_dir, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in _AUDIT_SKIP_DIRS)
+        rel_dir = Path(dirpath).relative_to(source_dir)
+        parts = set(rel_dir.parts)
+        if not (parts & {"telemetry", "cloud"}):
+            continue
+        for filename in sorted(filenames):
+            if filename.lower().endswith(_TEST_FILE_SUFFIXES):
+                continue
+            found.append((rel_dir / filename).as_posix())
+    return tuple(sorted(found))
+
+
+def _apply_patch_file(source_dir: Path, patch_path: Path, *, dry_run: bool = False) -> None:
+    """Apply a unified patch file using GNU ``patch -Np1``, raising on any hunk failure."""
+    cmd = ["patch", "--batch", "--forward", "-Np1"]
+    if dry_run:
+        cmd.append("--dry-run")
+    cmd.extend(["-i", str(patch_path)])
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(source_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("GNU 'patch' executable not found in PATH") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"exit status {proc.returncode}").strip()
+        mode = "dry-run " if dry_run else ""
+        raise RuntimeError(f"Generated patch {patch_path.name} failed {mode}apply: {detail}")
+
+
+def _copy_clean_tree_for_verify(source_dir: Path, dest_dir: Path) -> None:
+    shutil.copytree(
+        source_dir,
+        dest_dir,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".git", ".repos", "node_modules", "dist", "target", "__pycache__"),
+    )
+
+
 def _render_flat_pkgbuild(
     *,
     upstream_ref: str,
     pkgver: str,
     pkgrel: int,
+    vp_version: str | None,
     sha_source: str,
-    sha_standalone: str,
-    sha_launcher: str,
-    sha_desktop: str,
+    patch_checksums: list[tuple[str, str]],
+    repo_url: str = DEFAULT_REPO_URL,
 ) -> str:
-    archive_name, archive_url = _github_archive_source(upstream_ref)
+    archive_name, archive_url = _github_archive_source(upstream_ref, repo_url=repo_url)
     ref_no_v = upstream_ref[1:] if re.match(r"^v[0-9]", upstream_ref) else upstream_ref
     ref_safe = upstream_ref.replace("/", "-")
     depends_block = _format_bash_array("depends", ARCH_DEPENDS)
@@ -534,8 +501,21 @@ def _render_flat_pkgbuild(
     optdepends_block = _format_bash_array("optdepends", ARCH_OPTDEPENDS)
     options_str = " ".join(f"'{opt}'" for opt in ARCH_OPTIONS)
 
-    return f"""# Maintainer: Zhang Ke
-# Auto-generated flat AUR PKGBUILD by t3clean.py export-aur
+    source_entries = [f'  "{archive_name}::{archive_url}"']
+    checksum_entries = [f"  '{sha_source}'"]
+    patch_cmds: list[str] = []
+    for patch_name, patch_sha in patch_checksums:
+        source_entries.append(f"  '{patch_name}'")
+        checksum_entries.append(f"  '{patch_sha}'")
+        patch_cmds.append(f'  patch -Np1 -i "${{srcdir}}/{patch_name}"')
+
+    source_block = "\n".join(source_entries)
+    checksum_block = "\n".join(checksum_entries)
+    patch_apply_block = "\n".join(patch_cmds)
+    pinned_vp = (vp_version or "").strip()
+
+    return f"""# Maintainer: {MAINTAINER}
+# Generated by t3clean.py export-aur (https://github.com/LYB926/t3-code-no-telemetry)
 
 pkgname={PKGNAME}
 pkgver={pkgver}
@@ -546,41 +526,23 @@ url='{UPSTREAM_URL}'
 license=('MIT')
 options=({options_str})
 
-# Pinned upstream ref: {upstream_ref}
-# (Re-run `python3 t3clean.py export-aur --ref <ref> --source-sha256 auto` for AUR uploads.)
-# Optional build switches (all disabled by default for reproducible AUR builds)
-_build_deb="${{T3CLEAN_BUILD_DEB:-0}}"
-_use_system_electron="${{T3CLEAN_USE_SYSTEM_ELECTRON:-0}}"
-_system_electron_bin="${{T3CLEAN_SYSTEM_ELECTRON_BIN:-electron}}"
-_keep_updater="${{T3CLEAN_KEEP_UPDATER:-0}}"
-_keep_cloud="${{T3CLEAN_KEEP_CLOUD:-0}}"
-_strict_offline="${{T3CLEAN_STRICT_OFFLINE:-0}}"
+# Pinned Vite+ CLI version from upstream pnpm-workspace.yaml (empty -> fallback ^1.4.0)
+_vp_version='{pinned_vp}'
 _jobs="${{T3CLEAN_JOBS:-}}"
 
 {depends_block}
-if [[ "${{_use_system_electron}}" == "1" ]]; then
-  depends+=("${{_system_electron_bin}}")
-fi
-
-# All makedepends are in official Arch/CachyOS repos; vp is reused from PATH when
-# compatible or installed into the build cache via host npm pinned to upstream's
-# pnpm-workspace.yaml catalog version (fallback: vite-plus@^1.4.0, avoids rustup conflicts).
+# Official Arch/CachyOS repo build dependencies only; Vite+ (vp) is reused from
+# PATH when compatible or installed into the build cache via host npm pinned to
+# _vp_version (avoids outdated AUR vite-plus-bin, 2.x breaks, and rustup conflicts).
 {makedepends_block}
 {optdepends_block}
 
 # Coexists cleanly with t3code-bin (no conflicts/provides overlap).
-# Uses lightweight GitHub source archive instead of full git --mirror (~3.5 GiB).
 source=(
-  "{archive_name}::{archive_url}"
-  "t3clean-standalone.py"
-  "t3-code-no-telemetry.sh"
-  "t3-code-no-telemetry.desktop"
+{source_block}
 )
 sha256sums=(
-  '{sha_source}'
-  '{sha_standalone}'
-  '{sha_launcher}'
-  '{sha_desktop}'
+{checksum_block}
 )
 
 _t3clean_source_dir() {{
@@ -605,7 +567,6 @@ _t3clean_source_dir() {{
 
 _t3clean_arch() {{
   case "${{CARCH}}" in
-    x86_64)  printf 'x64' ;;
     aarch64) printf 'arm64' ;;
     *)       printf 'x64' ;;
   esac
@@ -673,18 +634,6 @@ _t3clean_apply_memory_guards() {{
     [[ -n "${{_mem_avail_kb}}" ]] && _mem_avail_mib=$(( _mem_avail_kb / 1024 ))
   fi
 
-  local _has_zram=0 _has_disk_swap=0 _swap_dev=""
-  if [[ -r /proc/swaps ]]; then
-    while read -r _swap_dev _; do
-      [[ -z "${{_swap_dev}}" || "${{_swap_dev}}" == "Filename" ]] && continue
-      if [[ "${{_swap_dev}}" == /dev/zram* ]]; then
-        _has_zram=1
-      else
-        _has_disk_swap=1
-      fi
-    done < /proc/swaps
-  fi
-
   local _cpus
   _cpus="$(nproc 2>/dev/null || echo 4)"
   local _target_jobs="" _target_child=""
@@ -710,32 +659,15 @@ _t3clean_apply_memory_guards() {{
       export RAYON_NUM_THREADS="${{RAYON_NUM_THREADS:-${{_target_jobs}}}}"
       export CARGO_BUILD_JOBS="${{CARGO_BUILD_JOBS:-${{_target_jobs}}}}"
       export npm_config_child_concurrency="${{npm_config_child_concurrency:-${{_target_child}}}}"
-      echo "NOTE: Auto-throttled build concurrency for tight memory (RAYON_NUM_THREADS=${{RAYON_NUM_THREADS}}, CARGO_BUILD_JOBS=${{CARGO_BUILD_JOBS}}, npm_config_child_concurrency=${{npm_config_child_concurrency}}; override with T3CLEAN_JOBS)." >&2
     fi
-  fi
-
-  if (( _mem_avail_mib > 0 && _mem_avail_mib < 6144 )); then
-    local _swap_note=""
-    if (( _has_zram == 1 && _has_disk_swap == 0 )); then
-      _swap_note=" (zram-only swap detected, no disk swap)"
-    elif (( _has_zram == 0 && _has_disk_swap == 0 )); then
-      _swap_note=" (no swap detected)"
-    fi
-    echo "WARNING: Low available memory (~$(( _mem_avail_mib / 1024 )).$(( (_mem_avail_mib % 1024) * 10 / 1024 )) GiB / ~$(( _mem_total_mib / 1024 )).$(( (_mem_total_mib % 1024) * 10 / 1024 )) GiB)${{_swap_note}}. Close heavy desktop apps or wrap the build with 'systemd-run --user --scope -p MemoryHigh=8G -p MemoryMax=10G ...' to avoid desktop freezes." >&2
   fi
 }}
 
 prepare() {{
   local _src_dir
   _src_dir="$(_t3clean_source_dir)"
-  local _patch_args=(--source "${{_src_dir}}")
-  if [[ "${{_keep_updater}}" == "1" ]]; then
-    _patch_args+=(--keep-updater)
-  fi
-  if [[ "${{_keep_cloud}}" == "1" ]]; then
-    _patch_args+=(--keep-cloud)
-  fi
-  python3 "${{srcdir}}/t3clean-standalone.py" patch "${{_patch_args[@]}}"
+  cd "${{_src_dir}}"
+{patch_apply_block}
 }}
 
 build() {{
@@ -746,7 +678,7 @@ build() {{
   export GIT_CEILING_DIRECTORIES="${{GIT_CEILING_DIRECTORIES:+${{GIT_CEILING_DIRECTORIES}}:}}$(dirname "${{_src_dir}}")"
   _t3clean_scrub_env
   _t3clean_apply_memory_guards
-  _t3clean_ensure_vp "${{_src_dir}}"
+  _t3clean_ensure_vp
 
   local _arch _build_ver
   _arch="$(_t3clean_arch)"
@@ -759,62 +691,22 @@ build() {{
     --arch "${{_arch}}" \\
     --build-version "${{_build_ver}}" \\
     --output-dir "${{srcdir}}/out"
-
-  if [[ "${{_use_system_electron}}" == "1" ]]; then
-    local _unpacked
-    _unpacked="$(find "${{srcdir}}/out" -maxdepth 1 -type d -name 'linux*-unpacked' -print -quit)"
-    if [[ -z "${{_unpacked}}" || ! -d "${{_unpacked}}/resources" ]]; then
-      echo "ERROR: Expected linux*-unpacked/resources under ${{srcdir}}/out" >&2
-      return 1
-    fi
-    rm -rf "${{srcdir}}/out/linux-system-electron"
-    install -d "${{srcdir}}/out/linux-system-electron"
-    cp -a "${{_unpacked}}/resources" "${{srcdir}}/out/linux-system-electron/resources"
-    echo "NOTE: Staged resources-only payload for system Electron (${{_system_electron_bin}}); ensure native addon ABI matches." >&2
-  fi
-
-  if [[ "${{_build_deb}}" == "1" ]]; then
-    local _deb_out="${{T3CLEAN_DEB_OUT_DIR:-${{srcdir}}/out-deb}}"
-    node scripts/build-desktop-artifact.ts \\
-      --platform linux \\
-      --target deb \\
-      --arch "${{_arch}}" \\
-      --build-version "${{_build_ver}}" \\
-      --skip-build \\
-      --output-dir "${{_deb_out}}"
-  fi
 }}
 
 check() {{
   local _artifact_dir
-  if [[ "${{_use_system_electron}}" == "1" ]]; then
-    _artifact_dir="${{srcdir}}/out/linux-system-electron"
-  else
-    _artifact_dir="$(find "${{srcdir}}/out" -maxdepth 1 -type d -name 'linux*-unpacked' -print -quit)"
-  fi
+  _artifact_dir="$(find "${{srcdir}}/out" -maxdepth 1 -type d -name 'linux*-unpacked' -print -quit)"
   if [[ -z "${{_artifact_dir}}" || ! -d "${{_artifact_dir}}" ]]; then
     echo "ERROR: Built desktop artifact directory not found under ${{srcdir}}/out" >&2
     return 1
   fi
-
-  local _verify_args=(--artifact "${{_artifact_dir}}")
-  if [[ "${{_keep_updater}}" == "1" ]]; then
-    _verify_args+=(--keep-updater)
-  fi
-  if [[ "${{_strict_offline}}" == "1" ]]; then
-    _verify_args+=(--strict-offline)
-  fi
-  python3 "${{srcdir}}/t3clean-standalone.py" verify "${{_verify_args[@]}}"
+{_AUR_CHECK_SCANNER}
 }}
 
 package() {{
   local _payload_dir _src_dir
   _src_dir="$(_t3clean_source_dir)"
-  if [[ "${{_use_system_electron}}" == "1" ]]; then
-    _payload_dir="${{srcdir}}/out/linux-system-electron"
-  else
-    _payload_dir="$(find "${{srcdir}}/out" -maxdepth 1 -type d -name 'linux*-unpacked' -print -quit)"
-  fi
+  _payload_dir="$(find "${{srcdir}}/out" -maxdepth 1 -type d -name 'linux*-unpacked' -print -quit)"
   if [[ -z "${{_payload_dir}}" || ! -d "${{_payload_dir}}" ]]; then
     echo "ERROR: Packaged payload directory missing under ${{srcdir}}/out" >&2
     return 1
@@ -822,14 +714,44 @@ package() {{
 
   install -d "${{pkgdir}}/usr/lib/${{pkgname}}"
   cp -a "${{_payload_dir}}/." "${{pkgdir}}/usr/lib/${{pkgname}}/"
-  if [[ "${{_use_system_electron}}" == "1" ]]; then
-    printf '%s\\n' "${{_system_electron_bin}}" > "${{pkgdir}}/usr/lib/${{pkgname}}/.use-system-electron"
-  fi
   chmod -R a+rX "${{pkgdir}}/usr/lib/${{pkgname}}"
 
-  install -Dm755 "${{srcdir}}/t3-code-no-telemetry.sh" "${{pkgdir}}/usr/bin/${{pkgname}}"
-  install -Dm644 "${{srcdir}}/t3-code-no-telemetry.desktop" \\
-    "${{pkgdir}}/usr/share/applications/${{pkgname}}.desktop"
+  install -Dm755 /dev/stdin "${{pkgdir}}/usr/bin/${{pkgname}}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Defense-in-depth telemetry suppression
+export T3CODE_TELEMETRY_ENABLED=false
+export DO_NOT_TRACK=1
+
+if [[ -z "${{CODEX_CLI_PATH-}}" ]] && command -v codex >/dev/null 2>&1; then
+  export CODEX_CLI_PATH="$(command -v codex)"
+fi
+
+extra_flags=()
+if [[ -n "${{WAYLAND_DISPLAY-}}" || "${{XDG_SESSION_TYPE-}}" == "wayland" ]]; then
+  extra_flags+=(--enable-features=UseOzonePlatform --ozone-platform=wayland --ozone-platform-hint=wayland)
+else
+  extra_flags+=(--ozone-platform-hint=auto)
+fi
+
+exec /usr/lib/t3-code-no-telemetry/t3code "${{extra_flags[@]}}" "$@"
+EOF
+
+  install -Dm644 /dev/stdin "${{pkgdir}}/usr/share/applications/${{pkgname}}.desktop" <<'EOF'
+[Desktop Entry]
+Name=T3 Code (No Telemetry)
+GenericName=Coding Agent IDE
+Comment=Minimal desktop GUI for coding agents (de-telemetrized source build)
+Exec=t3-code-no-telemetry %U
+Terminal=false
+Type=Application
+Icon=t3-code-no-telemetry
+StartupWMClass=com.t3tools.T3Code
+StartupNotify=true
+Categories=Development;IDE;
+MimeType=x-scheme-handler/t3code;
+EOF
 
   local _icon_src="${{_src_dir}}/assets/prod/black-universal-1024.png"
   if [[ -f "${{_icon_src}}" ]]; then
@@ -869,11 +791,10 @@ def _render_srcinfo(
     pkgver: str,
     pkgrel: int,
     sha_source: str,
-    sha_standalone: str,
-    sha_launcher: str,
-    sha_desktop: str,
+    patch_checksums: list[tuple[str, str]],
+    repo_url: str = DEFAULT_REPO_URL,
 ) -> str:
-    archive_name, archive_url = _github_archive_source(upstream_ref)
+    archive_name, archive_url = _github_archive_source(upstream_ref, repo_url=repo_url)
     lines: list[str] = [
         f"pkgbase = {PKGNAME}",
         f"\tpkgdesc = {PKGDESC}",
@@ -892,21 +813,13 @@ def _render_srcinfo(
         lines.append(f"\toptdepends = {opt}")
     for opt in ARCH_OPTIONS:
         lines.append(f"\toptions = {opt}")
-    lines.extend(
-        [
-            f"\tsource = {archive_name}::{archive_url}",
-            "\tsource = t3clean-standalone.py",
-            "\tsource = t3-code-no-telemetry.sh",
-            "\tsource = t3-code-no-telemetry.desktop",
-            f"\tsha256sums = {sha_source}",
-            f"\tsha256sums = {sha_standalone}",
-            f"\tsha256sums = {sha_launcher}",
-            f"\tsha256sums = {sha_desktop}",
-            "",
-            f"pkgname = {PKGNAME}",
-            "",
-        ]
-    )
+    lines.append(f"\tsource = {archive_name}::{archive_url}")
+    for patch_name, _ in patch_checksums:
+        lines.append(f"\tsource = {patch_name}")
+    lines.append(f"\tsha256sums = {sha_source}")
+    for _, patch_sha in patch_checksums:
+        lines.append(f"\tsha256sums = {patch_sha}")
+    lines.extend(["", f"pkgname = {PKGNAME}", ""])
     return "\n".join(lines)
 
 
@@ -916,90 +829,182 @@ def export_aur_package(
     *,
     upstream_ref: str = DEFAULT_REF,
     pkgrel: int = 1,
-    source_sha256: str | None = None,
+    source_dir: Path | None = None,
     source_tarball: Path | None = None,
-) -> list[Path]:
-    """Generate a 100% flat, zero-subdirectory AUR package directory.
+    source_sha256: str | None = None,
+    skip_verify: bool = False,
+    repo_url: str = DEFAULT_REPO_URL,
+) -> AurExportResult:
+    """Generate a minimal, patch-based flat AUR package directory.
 
-    Returns the list of created top-level file paths inside ``out_dir``.
+    Source input modes (mutually exclusive between ``source_dir`` and ``source_tarball``):
+    - ``source_tarball``: hashes and extracts the local tarball (zero network).
+    - ``source_dir``: generates patches from an existing clean checkout without mutating it.
+    - Neither provided: downloads the GitHub archive once, hashes and extracts it,
+      generates + verifies the unified ``.patch`` series, and writes real ``sha256sums``.
     """
+    _ = repo_root  # Retained in signature for caller clarity/compatibility.
     if pkgrel < 1:
         raise ValueError(f"pkgrel must be >= 1, got {pkgrel}")
-    if not upstream_ref or not upstream_ref.strip():
-        raise ValueError("upstream_ref must be a non-empty Git ref")
+    if source_dir is not None and source_tarball is not None:
+        raise ValueError("Cannot specify both source_dir and source_tarball; choose one.")
+    if source_tarball is not None and source_sha256 is not None:
+        raise ValueError("Cannot specify both source_sha256 and source_tarball; choose one.")
 
-    cleaned_ref = upstream_ref.strip()
-    sha_source = resolve_source_sha256(
-        cleaned_ref,
-        source_sha256=source_sha256,
-        source_tarball=source_tarball,
-    )
+    resolved_ref = resolve_upstream_ref(upstream_ref, repo_url=repo_url)
+    archive_name, archive_url = _github_archive_source(resolved_ref, repo_url=repo_url)
+    pkgver = _pkgver_for_ref(resolved_ref)
+    out_dir = Path(out_dir).expanduser().resolve()
 
-    repo_root = Path(repo_root).resolve()
-    out_dir = Path(out_dir).resolve()
-    arch_dir = repo_root / "packaging" / "arch"
-    src_launcher = arch_dir / "t3-code-no-telemetry.sh"
-    src_desktop = arch_dir / "t3-code-no-telemetry.desktop"
+    with tempfile.TemporaryDirectory(prefix="t3clean-aur-work-") as tmp_root:
+        tmp_path = Path(tmp_root)
+        owns_work_tree = False
 
-    for required in (src_launcher, src_desktop):
-        if not required.is_file():
-            raise FileNotFoundError(f"Missing packaging asset required for AUR export: {required}")
+        if source_dir is not None:
+            work_src = Path(source_dir).expanduser().resolve()
+            if not work_src.is_dir():
+                raise FileNotFoundError(f"Source directory does not exist: {work_src}")
+            sha_source = resolve_source_sha256(
+                resolved_ref,
+                source_sha256=source_sha256,
+                repo_url=repo_url,
+            )
+        elif source_tarball is not None:
+            tarball_path = Path(source_tarball).expanduser().resolve()
+            if not tarball_path.is_file():
+                raise FileNotFoundError(f"Source tarball not found: {tarball_path}")
+            sha_source = _sha256_file(tarball_path)
+            extract_dir = tmp_path / "extracted"
+            _safe_extract_tar_to(tarball_path, extract_dir)
+            work_src = _locate_extracted_source_root(extract_dir)
+            owns_work_tree = True
+        else:
+            downloaded_tarball = tmp_path / archive_name
+            _download_to_file(archive_url, downloaded_tarball)
+            actual_sha = _sha256_file(downloaded_tarball)
+            if source_sha256 is not None:
+                expected_sha = resolve_source_sha256(
+                    resolved_ref,
+                    source_sha256=source_sha256,
+                    repo_url=repo_url,
+                )
+                if expected_sha not in ("SKIP", actual_sha):
+                    raise ValueError(
+                        f"Downloaded archive SHA-256 mismatch: expected {expected_sha}, got {actual_sha}"
+                    )
+                sha_source = actual_sha if expected_sha != "SKIP" else "SKIP"
+            else:
+                sha_source = actual_sha
+            extract_dir = tmp_path / "extracted"
+            _safe_extract_tar_to(downloaded_tarball, extract_dir)
+            work_src = _locate_extracted_source_root(extract_dir)
+            owns_work_tree = True
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+        vp_version = read_required_vp_version(work_src)
+        audit_files = _collect_audit_files(work_src)
+        patch_series = generate_patch_series(work_src, PatchOptions())
+        non_empty_patches = [(name, body) for name, body in patch_series.items() if body]
+        if not non_empty_patches:
+            raise RuntimeError("No patches were generated from upstream source tree")
 
-    # 1. Generate standalone patcher + verifier CLI.
-    standalone_path = out_dir / "t3clean-standalone.py"
-    standalone_code = _build_standalone_script(repo_root)
-    standalone_path.write_text(standalone_code, encoding="utf-8")
-    standalone_path.chmod(standalone_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        # Stage patches in temp dir and validate real GNU patch application + telemetry verification.
+        staged_patch_dir = tmp_path / "patches"
+        staged_patch_dir.mkdir(parents=True, exist_ok=True)
+        staged_patch_paths: list[Path] = []
+        for patch_name, patch_body in non_empty_patches:
+            patch_path = staged_patch_dir / patch_name
+            patch_path.write_text(patch_body, encoding="utf-8")
+            staged_patch_paths.append(patch_path)
 
-    # 2. Copy launcher script & desktop entry flat into out_dir.
-    launcher_path = out_dir / "t3-code-no-telemetry.sh"
-    desktop_path = out_dir / "t3-code-no-telemetry.desktop"
-    shutil.copyfile(src_launcher, launcher_path)
-    launcher_path.chmod(launcher_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    shutil.copyfile(src_desktop, desktop_path)
+        verified_files = 0
+        if owns_work_tree:
+            for patch_path in staged_patch_paths:
+                _apply_patch_file(work_src, patch_path, dry_run=False)
+            if not skip_verify:
+                report = verify_artifact(work_src, VerifyOptions())
+                verified_files = report.scanned_files
+                if not report.ok:
+                    details = "; ".join(f"{f.rule}@{f.path}: {f.detail}" for f in report.findings[:10])
+                    raise RuntimeError(
+                        f"Patched upstream source failed telemetry verification "
+                        f"({len(report.findings)} finding(s)): {details}"
+                    )
+        else:
+            if skip_verify:
+                for patch_path in staged_patch_paths:
+                    _apply_patch_file(work_src, patch_path, dry_run=True)
+            else:
+                verify_copy = tmp_path / "verify-copy"
+                _copy_clean_tree_for_verify(work_src, verify_copy)
+                for patch_path in staged_patch_paths:
+                    _apply_patch_file(verify_copy, patch_path, dry_run=False)
+                report = verify_artifact(verify_copy, VerifyOptions())
+                verified_files = report.scanned_files
+                if not report.ok:
+                    details = "; ".join(f"{f.rule}@{f.path}: {f.detail}" for f in report.findings[:10])
+                    raise RuntimeError(
+                        f"Patched upstream source failed telemetry verification "
+                        f"({len(report.findings)} finding(s)): {details}"
+                    )
 
-    # 3. Compute exact SHA-256 sums for all local AUR files.
-    sha_standalone = _sha256_file(standalone_path)
-    sha_launcher = _sha256_file(launcher_path)
-    sha_desktop = _sha256_file(desktop_path)
+        # Write final flat AUR files only after all validations pass.
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for obsolete in _OBSOLETE_AUR_FILES:
+            obsolete_path = out_dir / obsolete
+            if obsolete_path.exists() or obsolete_path.is_symlink():
+                obsolete_path.unlink()
 
-    pkgver = _pkgver_for_ref(cleaned_ref)
+        written_patches: list[Path] = []
+        patch_checksums: list[tuple[str, str]] = []
+        for patch_name, patch_body in non_empty_patches:
+            dest_patch = out_dir / patch_name
+            dest_patch.write_text(patch_body, encoding="utf-8")
+            written_patches.append(dest_patch)
+            patch_checksums.append((patch_name, _sha256_file(dest_patch)))
 
-    # 4. Write flat PKGBUILD and matching .SRCINFO.
-    pkgbuild_path = out_dir / "PKGBUILD"
-    pkgbuild_path.write_text(
-        _render_flat_pkgbuild(
-            upstream_ref=cleaned_ref,
+        pkgbuild_path = out_dir / "PKGBUILD"
+        pkgbuild_path.write_text(
+            _render_flat_pkgbuild(
+                upstream_ref=resolved_ref,
+                pkgver=pkgver,
+                pkgrel=pkgrel,
+                vp_version=vp_version,
+                sha_source=sha_source,
+                patch_checksums=patch_checksums,
+                repo_url=repo_url,
+            ),
+            encoding="utf-8",
+        )
+
+        srcinfo_path = out_dir / ".SRCINFO"
+        srcinfo_path.write_text(
+            _render_srcinfo(
+                upstream_ref=resolved_ref,
+                pkgver=pkgver,
+                pkgrel=pkgrel,
+                sha_source=sha_source,
+                patch_checksums=patch_checksums,
+                repo_url=repo_url,
+            ),
+            encoding="utf-8",
+        )
+
+        gitignore_path = out_dir / ".gitignore"
+        gitignore_path.write_text(AUR_GITIGNORE_CONTENT, encoding="utf-8")
+
+        created_files = tuple([pkgbuild_path, srcinfo_path, *written_patches, gitignore_path])
+        return AurExportResult(
+            out_dir=out_dir,
+            ref=upstream_ref,
+            resolved_ref=resolved_ref,
             pkgver=pkgver,
             pkgrel=pkgrel,
-            sha_source=sha_source,
-            sha_standalone=sha_standalone,
-            sha_launcher=sha_launcher,
-            sha_desktop=sha_desktop,
-        ),
-        encoding="utf-8",
-    )
-
-    srcinfo_path = out_dir / ".SRCINFO"
-    srcinfo_path.write_text(
-        _render_srcinfo(
-            upstream_ref=cleaned_ref,
-            pkgver=pkgver,
-            pkgrel=pkgrel,
-            sha_source=sha_source,
-            sha_standalone=sha_standalone,
-            sha_launcher=sha_launcher,
-            sha_desktop=sha_desktop,
-        ),
-        encoding="utf-8",
-    )
-
-    return [
-        pkgbuild_path,
-        srcinfo_path,
-        standalone_path,
-        launcher_path,
-        desktop_path,
-    ]
+            source_archive=archive_name,
+            source_url=archive_url,
+            source_sha256=sha_source,
+            vp_version=vp_version,
+            patch_files=tuple(name for name, _ in patch_checksums),
+            verified_files=verified_files,
+            audit_files=audit_files,
+            files=created_files,
+        )

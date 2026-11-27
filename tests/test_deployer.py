@@ -178,6 +178,7 @@ class DeployerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
 
             with (
+                mock.patch("t3clean.deployer.time.sleep"),
                 mock.patch("t3clean.deployer.subprocess.run", side_effect=fake_systemctl),
                 mock.patch(
                     "t3clean.deployer.verify_artifact",
@@ -227,9 +228,12 @@ class DeployerTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(rows, [("t1", "original-title")])
 
-            # Verify new runtime installed with .install-complete and 0755 binary.
+            # Verify new runtime installed with version-matching .install-complete and 0755 binary.
             new_runtime = versions_dir / "0.1.12+notelemetry"
-            self.assertTrue((new_runtime / ".install-complete").is_file())
+            self.assertEqual(
+                (new_runtime / ".install-complete").read_text(encoding="utf-8").strip(),
+                "0.1.12+notelemetry",
+            )
             self.assertTrue(bool((new_runtime / "t3").stat().st_mode & stat.S_IXUSR))
 
             # Verify service-state.json updated.
@@ -349,6 +353,7 @@ class DeployerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
             with (
+                mock.patch("t3clean.deployer.time.sleep"),
                 mock.patch("t3clean.deployer.subprocess.run", side_effect=flaky_systemctl),
                 mock.patch(
                     "t3clean.deployer.verify_artifact",

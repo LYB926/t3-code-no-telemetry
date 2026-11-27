@@ -742,10 +742,17 @@ class BuilderTests(unittest.TestCase):
                         )
                     )
 
+            (src / "apps" / "server").mkdir(parents=True)
+            server_pkg = src / "apps" / "server" / "package.json"
+            original_server_pkg = json.dumps({"name": "t3", "version": "0.1.11"}, indent=2) + "\n"
+            server_pkg.write_text(original_server_pkg, encoding="utf-8")
+
             cmds: list[list[str]] = []
+            seen_pkg_versions: list[str] = []
 
             def fake_run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> None:
                 cmds.append(cmd)
+                seen_pkg_versions.append(json.loads(server_pkg.read_text(encoding="utf-8"))["version"])
                 if cmd[0] == "cargo":
                     mon = src / "native" / "resource-monitor" / "target" / "release" / "t3-resource-monitor"
                     mon.parent.mkdir(parents=True, exist_ok=True)
@@ -786,6 +793,9 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(len(cmds), 4)
             self.assertEqual(cmds[0], ["vp", "run", "--filter", "t3", "build"])
             self.assertEqual(cmds[2], ["node", "apps/server/scripts/cli.ts", "build-exe"])
+            self.assertEqual(seen_pkg_versions, ["0.1.12+notelemetry"] * 4)
+            # Original package.json is restored cleanly after build.
+            self.assertEqual(server_pkg.read_text(encoding="utf-8"), original_server_pkg)
 
     def test_build_target_server_bundle_packages_wrapper_dist_and_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,9 +12,11 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Iterator, Mapping
+import json
 
 from . import DEFAULT_NODE_VERSION
 from .patcher import PatchOptions, patch_source_tree
@@ -781,6 +783,31 @@ def _locate_resource_monitor_binary(source_dir: Path) -> Path:
     )
 
 
+@contextmanager
+def _stamped_server_package_version(source_dir: Path, version: str) -> Iterator[None]:
+    """Temporarily stamp ``apps/server/package.json#version`` to match ``version`` during build.
+
+    Upstream ``t3 serve`` enforces ``context.childVersion === packageJson.version`` when
+    launched by ``t3 __service-launcher``, while git release tags may still carry the previous
+    version in ``apps/server/package.json`` (and never carry ``+notelemetry``).
+    """
+    pkg_path = source_dir / "apps" / "server" / "package.json"
+    if not pkg_path.is_file():
+        yield
+        return
+    original_bytes = pkg_path.read_bytes()
+    data = json.loads(original_bytes.decode("utf-8"))
+    if not isinstance(data, dict) or data.get("version") == version:
+        yield
+        return
+    data["version"] = version
+    pkg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        yield
+    finally:
+        pkg_path.write_bytes(original_bytes)
+
+
 def _build_server_sea(
     source_dir: Path,
     *,
@@ -791,51 +818,52 @@ def _build_server_sea(
 ) -> Path:
     """Build the standalone Node SEA server tarball using upstream build scripts."""
     _check_server_sea_prerequisites(env)
-    _run_cmd(["vp", "run", "--filter", "t3", "build"], cwd=source_dir, env=env)
-    _run_cmd(
-        [
-            "cargo",
-            "build",
-            "--locked",
-            "--release",
-            "--manifest-path",
-            "native/resource-monitor/Cargo.toml",
-        ],
-        cwd=source_dir,
-        env=env,
-    )
+    with _stamped_server_package_version(source_dir, version):
+        _run_cmd(["vp", "run", "--filter", "t3", "build"], cwd=source_dir, env=env)
+        _run_cmd(
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--release",
+                "--manifest-path",
+                "native/resource-monitor/Cargo.toml",
+            ],
+            cwd=source_dir,
+            env=env,
+        )
 
-    built_monitor = _locate_resource_monitor_binary(source_dir)
-    staged_monitor = (
-        source_dir
-        / "apps"
-        / "server"
-        / "dist"
-        / "resource-monitor"
-        / f"linux-{arch}"
-        / "t3-resource-monitor"
-    )
-    staged_monitor.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(built_monitor, staged_monitor)
-    staged_monitor.chmod(0o755)
+        built_monitor = _locate_resource_monitor_binary(source_dir)
+        staged_monitor = (
+            source_dir
+            / "apps"
+            / "server"
+            / "dist"
+            / "resource-monitor"
+            / f"linux-{arch}"
+            / "t3-resource-monitor"
+        )
+        staged_monitor.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built_monitor, staged_monitor)
+        staged_monitor.chmod(0o755)
 
-    _run_cmd(["node", "apps/server/scripts/cli.ts", "build-exe"], cwd=source_dir, env=env)
-    _run_cmd(
-        [
-            "node",
-            "scripts/build-cli-archive.ts",
-            "--platform",
-            "linux",
-            "--arch",
-            arch,
-            "--version",
-            version,
-            "--output-dir",
-            str(output_dir),
-        ],
-        cwd=source_dir,
-        env=env,
-    )
+        _run_cmd(["node", "apps/server/scripts/cli.ts", "build-exe"], cwd=source_dir, env=env)
+        _run_cmd(
+            [
+                "node",
+                "scripts/build-cli-archive.ts",
+                "--platform",
+                "linux",
+                "--arch",
+                arch,
+                "--version",
+                version,
+                "--output-dir",
+                str(output_dir),
+            ],
+            cwd=source_dir,
+            env=env,
+        )
 
     expected = output_dir / f"t3-{version}-linux-{arch}.tar.gz"
     if expected.is_file():
@@ -854,72 +882,73 @@ def _build_server_bundle(
     isolated_node_bin: Path | None,
 ) -> Path:
     """Build a portable non-SEA server bundle archive with wrapper script and optional Node."""
-    _run_cmd(["vp", "run", "--filter", "t3", "build"], cwd=source_dir, env=env)
+    with _stamped_server_package_version(source_dir, version):
+        _run_cmd(["vp", "run", "--filter", "t3", "build"], cwd=source_dir, env=env)
 
-    server_dist = source_dir / "apps" / "server" / "dist"
-    if not (server_dist / "bin.mjs").is_file():
-        raise FileNotFoundError(f"Expected built server entrypoint at {server_dist / 'bin.mjs'}")
+        server_dist = source_dir / "apps" / "server" / "dist"
+        if not (server_dist / "bin.mjs").is_file():
+            raise FileNotFoundError(f"Expected built server entrypoint at {server_dist / 'bin.mjs'}")
 
-    stem = f"t3-{version}-linux-{arch}-bundle"
-    archive_path = output_dir / f"{stem}.tar.gz"
+        stem = f"t3-{version}-linux-{arch}-bundle"
+        archive_path = output_dir / f"{stem}.tar.gz"
 
-    with tempfile.TemporaryDirectory(prefix="t3clean-server-bundle-") as tmp_dir:
-        bundle_dir = Path(tmp_dir) / stem
-        bundle_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="t3clean-server-bundle-") as tmp_dir:
+            bundle_dir = Path(tmp_dir) / stem
+            bundle_dir.mkdir(parents=True, exist_ok=True)
 
-        ignore = None if sourcemap else shutil.ignore_patterns("*.map")
-        shutil.copytree(server_dist, bundle_dir / "dist", symlinks=True, ignore=ignore)
+            ignore = None if sourcemap else shutil.ignore_patterns("*.map")
+            shutil.copytree(server_dist, bundle_dir / "dist", symlinks=True, ignore=ignore)
 
-        server_pkg = source_dir / "apps" / "server" / "package.json"
-        if server_pkg.is_file():
-            shutil.copy2(server_pkg, bundle_dir / "package.json")
+            server_pkg = source_dir / "apps" / "server" / "package.json"
+            if server_pkg.is_file():
+                shutil.copy2(server_pkg, bundle_dir / "package.json")
 
-        server_node_modules = source_dir / "apps" / "server" / "node_modules"
-        if server_node_modules.is_dir():
-            shutil.copytree(
-                server_node_modules,
-                bundle_dir / "node_modules",
-                symlinks=True,
-                ignore=shutil.ignore_patterns(".bin", ".pnpm"),
+            server_node_modules = source_dir / "apps" / "server" / "node_modules"
+            if server_node_modules.is_dir():
+                shutil.copytree(
+                    server_node_modules,
+                    bundle_dir / "node_modules",
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns(".bin", ".pnpm"),
+                )
+
+            bundled_node = False
+            if isolated_node_bin is not None and isolated_node_bin.is_file():
+                node_dest = bundle_dir / "node" / "bin" / "node"
+                node_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(isolated_node_bin, node_dest)
+                node_dest.chmod(0o755)
+                bundled_node = True
+
+            wrapper_path = bundle_dir / "t3"
+            if bundled_node:
+                wrapper_body = (
+                    "#!/bin/sh\n"
+                    'DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
+                    'exec "$DIR/node/bin/node" "$DIR/dist/bin.mjs" "$@"\n'
+                )
+            else:
+                wrapper_body = (
+                    "#!/bin/sh\n"
+                    'DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
+                    'exec "${T3_NODE_BIN:-node}" "$DIR/dist/bin.mjs" "$@"\n'
+                )
+            wrapper_path.write_text(wrapper_body, encoding="utf-8")
+            wrapper_path.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+            (bundle_dir / "BUNDLE_README.txt").write_text(
+                (
+                    "T3 Code No-Telemetry Server Bundle\n"
+                    "Run via: ./t3 (or: node dist/bin.mjs)\n"
+                    "Ensure production native externals are installed if node_modules/ was not staged.\n"
+                ),
+                encoding="utf-8",
             )
 
-        bundled_node = False
-        if isolated_node_bin is not None and isolated_node_bin.is_file():
-            node_dest = bundle_dir / "node" / "bin" / "node"
-            node_dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(isolated_node_bin, node_dest)
-            node_dest.chmod(0o755)
-            bundled_node = True
-
-        wrapper_path = bundle_dir / "t3"
-        if bundled_node:
-            wrapper_body = (
-                "#!/bin/sh\n"
-                'DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
-                'exec "$DIR/node/bin/node" "$DIR/dist/bin.mjs" "$@"\n'
-            )
-        else:
-            wrapper_body = (
-                "#!/bin/sh\n"
-                'DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
-                'exec "${T3_NODE_BIN:-node}" "$DIR/dist/bin.mjs" "$@"\n'
-            )
-        wrapper_path.write_text(wrapper_body, encoding="utf-8")
-        wrapper_path.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-
-        (bundle_dir / "BUNDLE_README.txt").write_text(
-            (
-                "T3 Code No-Telemetry Server Bundle\n"
-                "Run via: ./t3 (or: node dist/bin.mjs)\n"
-                "Ensure production native externals are installed if node_modules/ was not staged.\n"
-            ),
-            encoding="utf-8",
-        )
-
-        if archive_path.exists():
-            archive_path.unlink()
-        with tarfile.open(archive_path, "w:gz") as tar:
-            tar.add(bundle_dir, arcname=stem)
+            if archive_path.exists():
+                archive_path.unlink()
+            with tarfile.open(archive_path, "w:gz") as tar:
+                tar.add(bundle_dir, arcname=stem)
 
     return archive_path
 

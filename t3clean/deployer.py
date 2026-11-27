@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -457,10 +458,15 @@ def _run_systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
         raise RuntimeError(f"{' '.join(cmd)} failed: {detail}") from exc
 
 
-def _restart_and_check_service() -> str:
-    """Reload systemd user units, restart ``t3code.service``, and verify it is active."""
+SERVICE_SETTLE_SECONDS = 5.0
+
+
+def _restart_and_check_service(*, settle_seconds: float = SERVICE_SETTLE_SECONDS) -> str:
+    """Reload systemd user units, restart ``t3code.service``, and verify it stays active."""
     _run_systemctl(["daemon-reload"])
     _run_systemctl(["restart", SERVICE_UNIT_NAME])
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
     active_result = _run_systemctl(["is-active", SERVICE_UNIT_NAME])
     state = active_result.stdout.strip()
     if state != "active":
@@ -470,7 +476,12 @@ def _restart_and_check_service() -> str:
     return state
 
 
-def _install_runtime_dir(source_root: Path, install_dir: Path) -> None:
+def _install_runtime_dir(
+    source_root: Path,
+    install_dir: Path,
+    *,
+    version: str | None = None,
+) -> None:
     """Install ``source_root`` into ``install_dir`` with executable ``t3`` and ``.install-complete``."""
     install_dir.parent.mkdir(parents=True, exist_ok=True)
     stage_dir = Path(
@@ -482,8 +493,9 @@ def _install_runtime_dir(source_root: Path, install_dir: Path) -> None:
         if not binary.is_file():
             raise FileNotFoundError(f"Runtime payload is missing 't3' executable: {binary}")
         binary.chmod(0o755)
+        sentinel_version = (version or install_dir.name).strip()
         (stage_dir / ".install-complete").write_text(
-            datetime.now(timezone.utc).isoformat() + "\n",
+            f"{sentinel_version}\n",
             encoding="utf-8",
         )
         if install_dir.exists():

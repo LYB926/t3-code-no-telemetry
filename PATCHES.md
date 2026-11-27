@@ -181,7 +181,7 @@ These two tiny patches do not change app features; they fix Linux source-build i
    - `ingest.t3.codes`
    - `phc_XOWci4oZP4VvLiEyrFqkFjP4CZn55mjYYBMREK5Wd6m`
    - `X-Axiom-Dataset`
-   - `T3CODE_POSTHOG_KEY` / `T3CODE_POSTHOG_HOST`
+   - `T3CODE_POSTHOG_KEY` / `T3CODE_POSTHOG_HOST` / `T3CODE_TELEMETRY_KEY` / `T3CODE_TELEMETRY_HOST`
    - `t3code:analytics-device-id`
    - `pk_live_...` / `pk_test_...` (Clerk publishable keys)
    - `app-update.yml`

@@ -633,6 +633,8 @@ import * as Layer from "effect/Layer";
 
 import type {{ TelemetryOwner }} from "./Identify.ts";
 
+export const wslDistroFamily = (_distroName: string): string | undefined => undefined;
+
 export class AnalyticsService extends Context.Service<
   AnalyticsService,
   {{

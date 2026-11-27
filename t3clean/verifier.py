@@ -77,6 +77,8 @@ _VERIFY_ALWAYS_LITERALS: tuple[tuple[str, str], ...] = (
     ("axiom-dataset-header", "X-Axiom-Dataset"),
     ("posthog-key-env", "T3CODE_POSTHOG_KEY"),
     ("posthog-host-env", "T3CODE_POSTHOG_HOST"),
+    ("telemetry-key-env", "T3CODE_TELEMETRY_KEY"),
+    ("telemetry-host-env", "T3CODE_TELEMETRY_HOST"),
     ("analytics-device-id", "t3code:analytics-device-id"),
 )
 

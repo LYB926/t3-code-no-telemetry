@@ -178,6 +178,8 @@ literals = (
     ("axiom-dataset-header", b"X-Axiom-Dataset"),
     ("posthog-key-env", b"T3CODE_POSTHOG_KEY"),
     ("posthog-host-env", b"T3CODE_POSTHOG_HOST"),
+    ("telemetry-key-env", b"T3CODE_TELEMETRY_KEY"),
+    ("telemetry-host-env", b"T3CODE_TELEMETRY_HOST"),
     ("analytics-device-id", b"t3code:analytics-device-id"),
 )
 clerk_re = re.compile(rb"pk_(?:live|test)_[A-Za-z0-9_-]{12,}")
@@ -599,7 +601,7 @@ _t3clean_scrub_env() {{
         ;;
     esac
   done < <(env)
-  unset T3CODE_DESKTOP_UPDATE_REPOSITORY GITHUB_REPOSITORY CSC_LINK CSC_KEY_PASSWORD
+  unset T3CODE_TELEMETRY_KEY T3CODE_TELEMETRY_HOST T3CODE_DESKTOP_UPDATE_REPOSITORY GITHUB_REPOSITORY CSC_LINK CSC_KEY_PASSWORD
 
   export T3CODE_TELEMETRY_ENABLED=false
   export DO_NOT_TRACK=1

@@ -60,6 +60,8 @@ SCRUB_ENV_PREFIXES: tuple[str, ...] = (
 
 SCRUB_ENV_EXACT: frozenset[str] = frozenset(
     {
+        "T3CODE_TELEMETRY_KEY",
+        "T3CODE_TELEMETRY_HOST",
         "T3CODE_DESKTOP_UPDATE_REPOSITORY",
         "GITHUB_REPOSITORY",
         "CSC_LINK",

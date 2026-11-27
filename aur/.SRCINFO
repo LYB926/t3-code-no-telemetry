@@ -1,6 +1,6 @@
 pkgbase = t3-code-no-telemetry
 	pkgdesc = T3 Code desktop application built from source with telemetry, device tracking, and cloud auth stripped
-	pkgver = 0.1.12
+	pkgver = 0.1.13
 	pkgrel = 1
 	url = https://github.com/pingdotgg/t3code
 	arch = x86_64
@@ -47,11 +47,11 @@ pkgbase = t3-code-no-telemetry
 	optdepends = openai-codex: use the system-installed Codex CLI
 	options = !strip
 	options = !debug
-	source = t3code-v0.1.12.tar.gz::https://github.com/pingdotgg/t3code/archive/refs/tags/v0.1.12.tar.gz
+	source = t3code-v0.1.13.tar.gz::https://github.com/pingdotgg/t3code/archive/refs/tags/v0.1.13.tar.gz
 	source = 0001-strip-telemetry.patch
 	source = 0002-linux-build-compat.patch
-	sha256sums = c57a856c2104ad5e3fcdcf96239b2d688521fc7450a69cdeb17844bcb13101b3
-	sha256sums = 9610ef0fa8f84c5d81e3a3c9dc5eed9c9dc0be2688a506238088421743855361
+	sha256sums = 4a4de056c9f9dd4424a5cf6e7914e62ae76c5dbfa0cbeef117f6ea5a185a0b95
+	sha256sums = a68f8c799ce6e697b931178b2d3ee3bc4704a5c03a00cab218f91b55ec67677d
 	sha256sums = 26aad837aba15b3ae0bb1728d71e05ab40d064023b07554bf33aa3a071a64765
 
 pkgname = t3-code-no-telemetry

@@ -229,6 +229,7 @@ def _cmd_deploy_server(args: argparse.Namespace) -> int:
         dry_run=bool(args.dry_run),
         skip_verify=bool(args.skip_verify),
         skip_systemctl=bool(args.skip_systemctl),
+        max_backups=args.max_backups,
     )
     result = deploy_server(options)
     if as_json:
@@ -581,6 +582,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-systemctl",
         action="store_true",
         help="Skip 'systemctl --user daemon-reload/restart' (for offline/staged deploys).",
+    )
+    p_deploy.add_argument(
+        "--max-backups",
+        type=int,
+        default=None,
+        help="Keep at most N newest backup directories after a successful deploy (prune oldest).",
     )
     _add_json_flag(p_deploy)
     p_deploy.set_defaults(handler=_cmd_deploy_server)

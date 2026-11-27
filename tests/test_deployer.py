@@ -83,6 +83,16 @@ def _seed_existing_host(root: Path) -> tuple[Path, Path, Path]:
         ),
         encoding="utf-8",
     )
+    dropin_dir = unit_dir / "t3code.service.d"
+    dropin_dir.mkdir(parents=True)
+    (dropin_dir / "proxy.conf").write_text(
+        "[Service]\nEnvironment=HTTP_PROXY=http://127.0.0.1:7899\nEnvironment=HTTPS_PROXY=http://127.0.0.1:7899\n",
+        encoding="utf-8",
+    )
+    (dropin_dir / "telemetry.conf").write_text(
+        "[Service]\nEnvironment=T3CODE_TELEMETRY_ENABLED=false\n",
+        encoding="utf-8",
+    )
 
     bin_dir.mkdir(parents=True)
     (bin_dir / "t3").write_text(f"#!/bin/sh\nexec '{prev_dir / 't3'}' \"$@\"\n", encoding="utf-8")
@@ -189,12 +199,23 @@ class DeployerTests(unittest.TestCase):
             self.assertEqual(result["systemctl_status"], "active")
             self.assertEqual(result["anonymous_id_removed"], "true")
 
-            # CRITICAL: Backup must live outside runtime/versions/.
+            # CRITICAL: Backup must live outside runtime/versions/ and be named by version.
             backup_dir = Path(result["backup_dir"])
             versions_dir = t3_home / "runtime" / "versions"
             self.assertTrue(backup_dir.is_dir())
+            self.assertEqual(backup_dir.name, "0.1.11")
             self.assertEqual(backup_dir.parent, t3_home / "runtime" / "no-telemetry-backups")
             self.assertNotIn(versions_dir, backup_dir.parents)
+
+            # Verify systemd drop-ins (e.g. proxy.conf) preserved live AND backed up.
+            self.assertIn(
+                "HTTP_PROXY=http://127.0.0.1:7899",
+                (unit_dir / "t3code.service.d" / "proxy.conf").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "HTTP_PROXY=http://127.0.0.1:7899",
+                (backup_dir / "t3code.service.d" / "proxy.conf").read_text(encoding="utf-8"),
+            )
 
             # Verify SQLite online backup integrity.
             backup_db = backup_dir / "statev2.sqlite"
@@ -500,6 +521,86 @@ class DeployerTests(unittest.TestCase):
             )
             self.assertEqual((bin_dir / "t3").read_bytes(), raw_binary)
             self.assertTrue(bool((bin_dir / "t3").stat().st_mode & stat.S_IXUSR))
+
+    def test_deploy_server_prunes_oldest_backups_and_restores_dropins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            t3_home, bin_dir, unit_dir = _seed_existing_host(root)
+
+            with mock.patch(
+                "t3clean.deployer.verify_artifact",
+                return_value=VerifyReport(scanned_files=2, findings=[]),
+            ):
+                with self.assertRaises(ValueError):
+                    deploy_server(
+                        DeployOptions(
+                            archive_path=_build_runtime_archive(root / "a0.tar.gz", "0.1.12+notelemetry"),
+                            t3_home=t3_home,
+                            bin_dir=bin_dir,
+                            unit_dir=unit_dir,
+                            skip_systemctl=True,
+                            max_backups=0,
+                        )
+                    )
+
+                r1 = deploy_server(
+                    DeployOptions(
+                        archive_path=_build_runtime_archive(root / "a1.tar.gz", "0.1.12+notelemetry"),
+                        t3_home=t3_home,
+                        bin_dir=bin_dir,
+                        unit_dir=unit_dir,
+                        skip_systemctl=True,
+                        max_backups=2,
+                    )
+                )
+                self.assertEqual(r1["backup_id"], "0.1.11")
+                self.assertEqual(r1["pruned_backups"], "")
+
+                r2 = deploy_server(
+                    DeployOptions(
+                        archive_path=_build_runtime_archive(root / "a2.tar.gz", "0.1.13+notelemetry"),
+                        t3_home=t3_home,
+                        bin_dir=bin_dir,
+                        unit_dir=unit_dir,
+                        skip_systemctl=True,
+                        max_backups=2,
+                    )
+                )
+                self.assertEqual(r2["backup_id"], "0.1.12+notelemetry")
+                self.assertEqual(r2["pruned_backups"], "")
+                self.assertEqual([b["backup_id"] for b in list_backups(t3_home)], ["0.1.12+notelemetry", "0.1.11"])
+
+                # Third deploy exceeds max_backups=2 -> oldest (0.1.11) is pruned.
+                r3 = deploy_server(
+                    DeployOptions(
+                        archive_path=_build_runtime_archive(root / "a3.tar.gz", "0.1.14+notelemetry"),
+                        t3_home=t3_home,
+                        bin_dir=bin_dir,
+                        unit_dir=unit_dir,
+                        skip_systemctl=True,
+                        max_backups=2,
+                    )
+                )
+                self.assertEqual(r3["backup_id"], "0.1.13+notelemetry")
+                self.assertEqual(r3["pruned_backups"], "0.1.11")
+                self.assertEqual(
+                    [b["backup_id"] for b in list_backups(t3_home)],
+                    ["0.1.13+notelemetry", "0.1.12+notelemetry"],
+                )
+                self.assertFalse((t3_home / "runtime" / "no-telemetry-backups" / "0.1.11").exists())
+
+                # Simulate drop-in deletion and confirm rollback restores proxy.conf.
+                (unit_dir / "t3code.service.d" / "proxy.conf").unlink()
+                rollback_server(
+                    t3_home,
+                    bin_dir,
+                    unit_dir=unit_dir,
+                    skip_systemctl=True,
+                )
+                self.assertIn(
+                    "HTTP_PROXY=http://127.0.0.1:7899",
+                    (unit_dir / "t3code.service.d" / "proxy.conf").read_text(encoding="utf-8"),
+                )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from .source import EXACT_SERVICE_VERSION_RE
 from .verifier import VerifyOptions, verify_artifact
 
 SERVICE_UNIT_NAME = "t3code.service"
+SERVICE_DROPIN_DIRNAME = f"{SERVICE_UNIT_NAME}.d"
 BACKUPS_SUBDIR = "no-telemetry-backups"
 _ARCHIVE_VERSION_RE = re.compile(
     r"^t3-(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"
@@ -40,6 +41,7 @@ class DeployOptions:
     dry_run: bool = False
     skip_verify: bool = False
     skip_systemctl: bool = False
+    max_backups: int | None = None
 
 
 def _resolve_unit_dir(unit_dir: Path | None) -> Path:
@@ -255,11 +257,13 @@ def _online_sqlite_backup(source_db: Path, dest_db: Path) -> None:
 
 
 def _create_backup_id(backups_root: Path, prev_version: str | None) -> str:
-    """Generate a unique, sortable backup identifier."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    """Generate a unique backup identifier named by the backed-up version."""
     raw_label = prev_version or "fresh"
     label = _SAFE_LABEL_RE.sub("_", raw_label).strip("_") or "fresh"
-    base_id = f"{timestamp}-{label}"
+    if not (backups_root / label).exists():
+        return label
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base_id = f"{label}-{timestamp}"
     candidate = base_id
     counter = 1
     while (backups_root / candidate).exists():
@@ -305,6 +309,12 @@ def _backup_current_state(
         shutil.copy2(unit_path, backup_dir / SERVICE_UNIT_NAME)
         has_systemd_unit = True
 
+    has_systemd_dropins = False
+    dropin_dir = unit_dir / SERVICE_DROPIN_DIRNAME
+    if dropin_dir.is_dir():
+        shutil.copytree(dropin_dir, backup_dir / SERVICE_DROPIN_DIRNAME, symlinks=True)
+        has_systemd_dropins = True
+
     has_bin_wrapper = False
     bin_wrapper = bin_dir / "t3"
     if bin_wrapper.is_symlink():
@@ -337,6 +347,7 @@ def _backup_current_state(
         "hasRuntimeVersion": has_runtime_version,
         "hasServiceState": has_service_state,
         "hasSystemdUnit": has_systemd_unit,
+        "hasSystemdDropIns": has_systemd_dropins,
         "hasBinWrapper": has_bin_wrapper,
         "hasServiceEnv": has_service_env,
         "hasDatabaseBackup": has_db_backup,
@@ -526,6 +537,32 @@ def list_backups(t3_home: Path) -> list[dict[str, str]]:
     return [item[1] for item in records]
 
 
+def prune_backups(
+    t3_home: Path,
+    max_backups: int,
+    *,
+    keep_backup_ids: set[str] | None = None,
+) -> list[str]:
+    """Delete oldest backup snapshots beyond ``max_backups``, returning pruned IDs."""
+    if max_backups < 1:
+        raise ValueError(f"max_backups must be >= 1, got {max_backups}")
+    backups = list_backups(t3_home)
+    if len(backups) <= max_backups:
+        return []
+
+    protected = keep_backup_ids or set()
+    kept = 0
+    pruned: list[str] = []
+    for entry in backups:
+        backup_id = entry["backup_id"]
+        if backup_id in protected or kept < max_backups:
+            kept += 1
+            continue
+        shutil.rmtree(Path(entry["path"]), ignore_errors=False)
+        pruned.append(backup_id)
+    return pruned
+
+
 def rollback_server(
     t3_home: Path,
     bin_dir: Path,
@@ -592,6 +629,13 @@ def rollback_server(
     elif not manifest.get("hasSystemdUnit", False) and unit_target.exists():
         unit_target.unlink()
 
+    dropin_backup = backup_dir / SERVICE_DROPIN_DIRNAME
+    dropin_target = resolved_unit / SERVICE_DROPIN_DIRNAME
+    if dropin_backup.is_dir():
+        if dropin_target.exists():
+            shutil.rmtree(dropin_target)
+        shutil.copytree(dropin_backup, dropin_target, symlinks=True)
+
     bin_target = resolved_bin / "t3"
     bin_symlink_backup = backup_dir / "bin-t3.symlink"
     bin_file_backup = backup_dir / "bin-t3"
@@ -641,6 +685,8 @@ def rollback_server(
 
 def deploy_server(options: DeployOptions) -> dict[str, str]:
     """Deploy a server runtime archive into ``t3_home`` with backup and automatic rollback."""
+    if options.max_backups is not None and options.max_backups < 1:
+        raise ValueError(f"max_backups must be >= 1, got {options.max_backups}")
     archive_path = Path(options.archive_path).expanduser().resolve()
     t3_home = Path(options.t3_home).expanduser().resolve()
     bin_dir = Path(options.bin_dir).expanduser().resolve()
@@ -755,12 +801,21 @@ def deploy_server(options: DeployOptions) -> dict[str, str]:
                     f"{exc}; {rollback_note}"
                 ) from exc
 
+        pruned_backups: list[str] = []
+        if options.max_backups is not None:
+            pruned_backups = prune_backups(
+                t3_home,
+                options.max_backups,
+                keep_backup_ids={backup_id},
+            )
+
         return {
             "status": "deployed",
             "version": new_version,
             "previous_version": prev_version or "",
             "backup_id": backup_id,
             "backup_dir": str(backup_dir),
+            "pruned_backups": ",".join(pruned_backups),
             "install_dir": str(install_dir),
             "unit_path": str(unit_path),
             "bin_wrapper": str(bin_wrapper),

@@ -1,6 +1,7 @@
 """Unit tests for t3clean.patcher (latest stable v0.1.12+, patch generation, and TS parser edge cases)."""
 
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -418,7 +419,16 @@ def _write_mock_tree(root: Path, *, legacy_v0111: bool = False) -> None:
 class TestPackageConstants(unittest.TestCase):
     def test_default_constants(self) -> None:
         self.assertEqual(DEFAULT_REPO_URL, "https://github.com/pingdotgg/t3code.git")
-        self.assertEqual(DEFAULT_REF, "v0.1.12")
+        self.assertRegex(DEFAULT_REF, r"^v\d+\.\d+\.\d+$")
+        pkgbuild = (Path(__file__).resolve().parent.parent / "aur" / "PKGBUILD").read_text(
+            encoding="utf-8"
+        )
+        pkgver_match = re.search(r"^pkgver=([^\s'\"]+)", pkgbuild, re.MULTILINE)
+        self.assertIsNotNone(pkgver_match)
+        assert pkgver_match is not None
+        pkgver = pkgver_match.group(1)
+        if re.fullmatch(r"\d+\.\d+\.\d+", pkgver):
+            self.assertEqual(DEFAULT_REF, f"v{pkgver}")
         self.assertEqual(DEFAULT_NODE_VERSION, "26.13.1")
         self.assertEqual(PATCH_MARKER, "// @t3-no-telemetry-patched")
 

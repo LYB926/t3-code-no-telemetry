@@ -366,7 +366,10 @@ class TestCliAndAur(unittest.TestCase):
         self.assertIn("patch -Np1 -i", pkgbuild)
         self.assertIn("install -Dm755 /dev/stdin", pkgbuild)
         self.assertIn("install -Dm644 /dev/stdin", pkgbuild)
-        self.assertIn("_vp_version='1.8.0'", pkgbuild)
+        self.assertRegex(
+            pkgbuild,
+            re.compile(r"^_vp_version='\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?'$", re.MULTILINE),
+        )
 
         # Patch checksums in aur/PKGBUILD and aur/.SRCINFO must match on-disk patch files.
         pkg_sums = re.findall(r"'([0-9a-f]{64})'", re.search(r"sha256sums=\(([^)]+)\)", pkgbuild, re.DOTALL).group(1))
@@ -376,7 +379,8 @@ class TestCliAndAur(unittest.TestCase):
         self.assertEqual(pkg_sums[1], _sha256(AUR_DIR / "0001-strip-telemetry.patch"))
         self.assertEqual(pkg_sums[2], _sha256(AUR_DIR / "0002-linux-build-compat.patch"))
 
-        if shutil.which("makepkg"):
+        # makepkg refuses to execute as root (exit 10); skip only under uid 0.
+        if shutil.which("makepkg") and (not hasattr(os, "geteuid") or os.geteuid() != 0):
             mk = subprocess.run(
                 ["makepkg", "--printsrcinfo"],
                 cwd=str(AUR_DIR),

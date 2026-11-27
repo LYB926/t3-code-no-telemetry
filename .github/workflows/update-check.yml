@@ -130,9 +130,10 @@ jobs:
           PY
           fi
 
-          run_step "Run unit test suite" python3 -W error::SyntaxWarning -m unittest discover -s tests -v
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          run_step "Run unit test suite" \
+            su -w GITHUB_WORKSPACE builder -c 'export HOME=/home/builder && cd "$GITHUB_WORKSPACE" && python3 -W error::SyntaxWarning -m unittest discover -s tests -v'
           run_step "Check PKGBUILD bash syntax" bash -n aur/PKGBUILD
-          chown -R builder:builder "$GITHUB_WORKSPACE/aur"
           run_step "Verify .SRCINFO matches makepkg --printsrcinfo" \
             su -w GITHUB_WORKSPACE builder -c 'cd "$GITHUB_WORKSPACE/aur" && diff -u .SRCINFO <(makepkg --printsrcinfo)'
           run_step "Run namcap on aur/PKGBUILD" namcap aur/PKGBUILD

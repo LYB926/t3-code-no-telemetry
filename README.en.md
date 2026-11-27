@@ -4,6 +4,11 @@
 
 A telemetry-free source build of **T3 Code** for Linux, with usage analytics reporting, device fingerprinting, cloud trace logging, built-in auto-updates, and cloud auth hooks stripped out so you can run T3 Code purely locally.
 
+> **Verified Environments** (`v0.1.13`):
+> - **Desktop**: `CachyOS x86_64` (`Linux 7.3.6-1-cachyos`) — built from source and running locally;
+> - **Server**: `Ubuntu 24.04.4 LTS (Noble Numbat) x86_64` (`Linux 6.8.0-110-generic`) — single-executable ELF (`server-sea`) built from source, upgraded with hot backups, and running under `systemd`;
+> - **Remote connectivity**: both the de-telemetrized T3 Code desktop app on CachyOS and web browsers connect cleanly to the remote Ubuntu workstation server.
+
 The build toolchain uses Python 3.10+ standard library only (zero third-party Python dependencies). It provides both a minimal `PKGBUILD` + `.patch` AUR recipe (on the `master` branch) for Arch / CachyOS and a standalone `t3clean.py` CLI for generic Linux distributions.
 
 ---

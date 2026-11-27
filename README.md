@@ -4,6 +4,11 @@
 
 从官方源码构建的 **T3 Code 去遥测版本**，移除了使用分析上报、设备指纹追踪、云端追踪日志、内置自动更新以及云端登录钩子，让你可以在 Linux 上纯粹以本地方式运行 T3 Code。
 
+> **已实测通过的环境**（`v0.1.13`）：
+> - **桌面端**：`CachyOS x86_64`（`Linux 7.3.6-1-cachyos`）— 本地源码编译并运行正常；
+> - **服务端**：`Ubuntu 24.04.4 LTS (Noble Numbat) x86_64`（`Linux 6.8.0-110-generic`）— 单文件 ELF（`server-sea`）源码编译、热备升级与 `systemd` 托管运行正常；
+> - **跨机联调**：在 CachyOS 上通过去遥测版 T3 Code 桌面端以及浏览器连接远程 Ubuntu 工作站上的 T3 Code Server 均工作正常。
+
 本工具只使用 Python 3.10+ 标准库，不需要安装额外 Python 依赖；同时提供面向 Arch / CachyOS 的极简 `PKGBUILD` + `.patch` 配方（位于 `master` 分支）以及面向通用 Linux 的命令行构建脚本 `t3clean.py`。
 
 ---
